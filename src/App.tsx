@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { 
   LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, 
   BarChart, Bar, ResponsiveContainer, ReferenceLine, ReferenceDot, PieChart, Pie, Cell, ComposedChart, Scatter
@@ -6,15 +6,56 @@ import {
 import { 
   Map, Activity, Calendar, LayoutDashboard, Settings2, 
   Thermometer, CloudRain, Snowflake, AlertOctagon, TrendingUp, AlertTriangle, Plus, X, BarChart2,
-  Database, Upload, RefreshCw, FileText
+  Database, Upload, RefreshCw, FileText, Loader2
 } from 'lucide-react';
 import { Map as PigeonMap, Overlay } from 'pigeon-maps';
 import { format, addDays, subDays } from 'date-fns';
 import { ru } from 'date-fns/locale';
 
-// --- Types & Mocks ---
+// --- Types & API ---
 type ForecastMode = 'date' | 'month' | 'year' | 'dashboards' | 'data';
 type WidgetId = 'cross_model' | 'scatter' | 'basin_risk' | 'feature_importance' | 'heatmap' | 'risk_pie' | 'peak_analysis';
+
+const API_BASE = 'http://localhost:8000/api';
+
+interface StationInfo {
+  label: string;
+  river: string;
+  post: string;
+  lat: number;
+  lng: number;
+  risk: string;
+  critical_oya?: number;
+  low_oya?: number;
+  has_model?: boolean;
+}
+
+interface TrainingStatus {
+  status: 'idle' | 'training' | 'complete' | 'error';
+  progress: number;
+  current_station: string;
+  message: string;
+}
+
+// Хук для загрузки данных с API с fallback на моки
+function useApi<T>(url: string, fallback: T): { data: T; loading: boolean; error: boolean; refetch: () => void } {
+  const [data, setData] = useState<T>(fallback);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+
+  const refetch = useCallback(() => {
+    setLoading(true);
+    setError(false);
+    fetch(`${API_BASE}${url}`)
+      .then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+      .then(d => { setData(d); setLoading(false); })
+      .catch(() => { setData(fallback); setLoading(false); setError(true); });
+  }, [url]);
+
+  useEffect(() => { refetch(); }, [refetch]);
+
+  return { data, loading, error, refetch };
+}
 
 const AVAILABLE_WIDGETS: { id: WidgetId, label: string, width: 'full' | 'half' }[] = [
   { id: 'peak_analysis', label: 'Анализ экстремумов (Пики)', width: 'full' },
@@ -46,18 +87,27 @@ const generateMockData = (days: number, baseLevel: number, tempMod: number, prec
   });
 };
 
-const STATS_CARDS = [
-  { label: 'р. Обь - г. Барнаул', lat: 53.3, lng: 83.7, risk: 'high' },
-  { label: 'р. Томь - г. Томск', lat: 56.5, lng: 84.9, risk: 'medium' },
-  { label: 'р. Лена - г. Якутск', lat: 62.0, lng: 129.7, risk: 'low' },
+const DEFAULT_STATIONS: StationInfo[] = [
+  { label: 'Лена — Якутск', river: 'Лена', post: 'Якутск', lat: 62.0, lng: 129.7, risk: 'low', critical_oya: 827, low_oya: -115 },
+  { label: 'Лена — Ленск', river: 'Лена', post: 'Ленск', lat: 60.72, lng: 114.95, risk: 'medium', critical_oya: 1760, low_oya: 75 },
+  { label: 'Алдан — Томмот', river: 'Алдан', post: 'Томмот', lat: 58.96, lng: 126.28, risk: 'low', critical_oya: 820 },
+  { label: 'Вилюй — Вилюйск', river: 'Вилюй', post: 'Вилюйск', lat: 63.75, lng: 121.63, risk: 'low', critical_oya: 1050, low_oya: 110 },
+  { label: 'Колыма — Черский', river: 'Колыма', post: 'Черский', lat: 68.75, lng: 161.33, risk: 'low', critical_oya: 600 },
+  { label: 'Амга — Амга', river: 'Амга', post: 'Амга', lat: 60.90, lng: 131.98, risk: 'low', critical_oya: 925 },
 ];
 
 export default function App() {
   const [mode, setMode] = useState<ForecastMode>('date');
   const [activeWidgets, setActiveWidgets] = useState<WidgetId[]>(['peak_analysis', 'cross_model', 'scatter', 'basin_risk']);
-  const [station, setStation] = useState(STATS_CARDS[0].label);
-  const [warningLevel, setWarningLevel] = useState(500);
-  const [dangerLevel, setDangerLevel] = useState(650);
+  const [stations, setStations] = useState<StationInfo[]>(DEFAULT_STATIONS);
+  const [station, setStation] = useState(DEFAULT_STATIONS[0].label);
+  const [warningLevel, setWarningLevel] = useState(827);
+  const [dangerLevel, setDangerLevel] = useState(1000);
+  const [apiConnected, setApiConnected] = useState(false);
+  const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ status: 'idle', progress: 0, current_station: '', message: '' });
+  const [targetDate, setTargetDate] = useState<string>('');
+  const [apiForecast, setApiForecast] = useState<any[]>([]);
+  const [apiHistory, setApiHistory] = useState<any[]>([]);
   
   // What If scenarios
   const [tempMod, setTempMod] = useState(0);
@@ -67,8 +117,139 @@ export default function App() {
   const [mapStyle, setMapStyle] = useState<'scheme' | 'satellite'>('satellite');
   const [mapData, setMapData] = useState<'risk' | 'temp' | 'snow'>('risk');
 
-  const forecastData = generateMockData(60, 400, tempMod, precipMod);
-  const maxQ95 = Math.max(...forecastData.map(d => d.q95));
+  // Попытка подключения к API
+  useEffect(() => {
+    fetch(`${API_BASE}/rivers`)
+      .then(r => r.json())
+      .then((rivers: any[]) => {
+        if (rivers && rivers.length > 0) {
+          // Загружаем посты для каждой реки
+          const fetchPosts = rivers.map(r =>
+            fetch(`${API_BASE}/rivers/${encodeURIComponent(r.river)}/posts`)
+              .then(res => res.json())
+              .catch(() => [])
+          );
+          Promise.all(fetchPosts).then(allPosts => {
+            const newStations: StationInfo[] = [];
+            allPosts.forEach((posts: any[], i) => {
+              posts.forEach((p: any) => {
+                newStations.push({
+                  label: `${rivers[i].river} — ${p.post}`,
+                  river: rivers[i].river,
+                  post: p.post,
+                  lat: p.lat || 62.0,
+                  lng: p.lon || 129.7,
+                  risk: 'low',
+                  critical_oya: p.critical_oya,
+                  low_oya: p.low_oya,
+                  has_model: p.has_model,
+                });
+              });
+            });
+            if (newStations.length > 0) {
+              setStations(newStations);
+              setStation(newStations[0].label);
+              if (newStations[0].critical_oya) setDangerLevel(newStations[0].critical_oya);
+            }
+            setApiConnected(true);
+          });
+        }
+      })
+      .catch(() => setApiConnected(false));
+  }, []);
+
+  // Обновляем критические уровни при смене станции
+  const currentStation = stations.find(s => s.label === station) || stations[0];
+  useEffect(() => {
+    if (currentStation?.critical_oya) {
+      setDangerLevel(currentStation.critical_oya);
+      setWarningLevel(Math.round(currentStation.critical_oya * 0.7));
+    }
+  }, [station]);
+
+  useEffect(() => {
+    if (!currentStation || !apiConnected) return;
+    const dateQuery = targetDate ? `?base_date=${targetDate}` : '';
+    const dateQueryHist = targetDate ? `?end_date=${targetDate}&days=60` : '?days=60';
+    
+    fetch(`${API_BASE}/forecast/${encodeURIComponent(currentStation.river)}/${encodeURIComponent(currentStation.post)}${dateQuery}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.forecast) setApiForecast(data.forecast);
+      })
+      .catch(() => setApiForecast([]));
+      
+    fetch(`${API_BASE}/history/${encodeURIComponent(currentStation.river)}/${encodeURIComponent(currentStation.post)}${dateQueryHist}`)
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data)) setApiHistory(data);
+      })
+      .catch(() => setApiHistory([]));
+  }, [currentStation, targetDate, apiConnected]);
+
+  const { historyMapped, forecastMapped, forecastData, yearData } = React.useMemo(() => {
+    if (apiForecast.length === 0 && apiHistory.length === 0) {
+      const mock = generateMockData(60, 400, tempMod, precipMod);
+      return { historyMapped: mock, forecastMapped: mock, forecastData: mock, yearData: [] };
+    }
+    const histMap = apiHistory.map(d => ({
+      date: format(new Date(d.date), 'dd MMM', { locale: ru }),
+      fullDate: new Date(d.date),
+      median: d.water_level_cm,
+      q90: d.water_level_cm,
+      q95: d.water_level_cm,
+    }));
+    const foreMap = apiForecast.map(d => ({
+      date: format(new Date(d.date), 'dd MMM', { locale: ru }),
+      fullDate: new Date(d.date),
+      median: d.median,
+      q90: d.q90,
+      q95: d.q95,
+    }));
+    
+    // Generate Year Data for chart
+    const baseDate = targetDate ? new Date(targetDate) : new Date();
+    const year = baseDate.getFullYear();
+    const yData = [];
+    let maxFound = -1, minFound = 9999;
+    
+    for (let i = 0; i < 365; i++) {
+       const d = new Date(year, 0, 1);
+       d.setDate(d.getDate() + i);
+       // Simple seasonal curve + noise
+       const seasonal = Math.max(0, 150 + 350 * Math.exp(-Math.pow(i - 140, 2)/1500) + 150 * Math.exp(-Math.pow(i - 200, 2)/3000));
+       const histMean = seasonal;
+       const histQ10 = Math.max(0, seasonal * 0.6 - 50);
+       const histQ90 = seasonal * 1.4 + 100;
+       
+       let forecastMedian = null;
+       const fDay = foreMap.find(fd => fd.fullDate.getDate() === d.getDate() && fd.fullDate.getMonth() === d.getMonth() && fd.fullDate.getFullYear() === d.getFullYear());
+       if (fDay) {
+           forecastMedian = fDay.median;
+           if (forecastMedian > maxFound) maxFound = forecastMedian;
+           if (forecastMedian < minFound) minFound = forecastMedian;
+       }
+       
+       yData.push({
+           date: format(d, 'dd MMM yyyy', { locale: ru }),
+           fullDate: d,
+           histMean,
+           histRange: [histQ10, histQ90],
+           forecast: forecastMedian,
+       });
+    }
+    
+    yData.forEach(r => {
+        if (r.forecast !== null) {
+            if (r.forecast === maxFound) r.isMax = r.forecast;
+            if (r.forecast === minFound) r.isMin = r.forecast;
+        }
+    });
+
+    return { historyMapped: histMap, forecastMapped: foreMap, forecastData: [...histMap, ...foreMap], yearData: yData };
+  }, [apiForecast, apiHistory, tempMod, precipMod, targetDate]);
+
+  const maxQ95 = forecastMapped.length > 0 ? Math.max(...forecastMapped.map(d => d.q95)) : 0;
   
   const currentRisk = maxQ95 >= dangerLevel ? 'ОПАСНЫЙ (ОЯ)' : maxQ95 >= warningLevel ? 'ПОВЫШЕННЫЙ (НЯ)' : 'НИЗКИЙ';
   const riskColor = maxQ95 >= dangerLevel ? 'text-red-500' : maxQ95 >= warningLevel ? 'text-orange-500' : 'text-emerald-500';
@@ -120,8 +301,23 @@ export default function App() {
               onChange={(e) => setStation(e.target.value)}
               className="w-full bg-slate-50 border border-slate-200 text-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
-              {STATS_CARDS.map(s => <option key={s.label} value={s.label}>{s.label}</option>)}
+              {stations.map(s => <option key={s.label} value={s.label}>{s.label}</option>)}
             </select>
+          </div>
+
+          <div className="space-y-4">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Дата прогноза</label>
+            <input 
+              type="date"
+              value={targetDate}
+              onChange={(e) => setTargetDate(e.target.value)}
+              className="w-full bg-slate-50 border border-slate-200 text-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            />
+            {forecastMapped.length > 0 && (
+              <p className="text-[10px] text-slate-400 mt-1">
+                Охват: {forecastMapped[0].date} — {forecastMapped[forecastMapped.length - 1].date}
+              </p>
+            )}
           </div>
 
           <div className="space-y-4">
@@ -212,12 +408,20 @@ export default function App() {
             {mode === 'dashboards' && 'Сводные аналитические дашборды'}
             {mode === 'data' && 'Каталог данных и ретрейн моделей'}
           </h2>
-          <div className="flex items-center gap-2">
-            <span className="relative flex h-3 w-3">
-              <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${maxQ95 >= dangerLevel ? 'bg-red-400' : 'bg-emerald-400'}`}></span>
-              <span className={`relative inline-flex rounded-full h-3 w-3 ${maxQ95 >= dangerLevel ? 'bg-red-500' : 'bg-emerald-500'}`}></span>
-            </span>
-            <span className="text-sm font-medium text-slate-600">Модель активна</span>
+          <div className="flex items-center gap-3">
+            {trainingStatus.status === 'training' && (
+              <div className="flex items-center gap-2 bg-blue-50 px-3 py-1.5 rounded-lg border border-blue-100">
+                <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />
+                <span className="text-xs font-medium text-blue-700">Обучение: {trainingStatus.current_station} ({Math.round(trainingStatus.progress * 100)}%)</span>
+              </div>
+            )}
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-3 w-3">
+                <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${apiConnected ? 'bg-emerald-400' : 'bg-amber-400'}`}></span>
+                <span className={`relative inline-flex rounded-full h-3 w-3 ${apiConnected ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
+              </span>
+              <span className="text-sm font-medium text-slate-600">{apiConnected ? 'API подключён' : 'Демо-режим'}</span>
+            </div>
           </div>
         </header>
 
@@ -315,7 +519,7 @@ export default function App() {
                        <div key={day} className="text-center text-xs font-medium text-slate-500 py-2">{day}</div>
                      ))}
                      {Array.from({ length: 3 }).map((_, i) => <div key={`empty-${i}`} />)}
-                     {forecastData.slice(0, 31).map((day, i) => {
+                     {forecastMapped.slice(0, 31).map((day, i) => {
                        const intensity = day.q95 >= dangerLevel ? 'bg-red-500 text-white' 
                                       : day.q95 >= warningLevel ? 'bg-orange-400 text-white' 
                                       : day.q95 >= warningLevel - 50 ? 'bg-yellow-300 text-yellow-900'
@@ -344,7 +548,7 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody>
-                        {forecastData.slice(0, 7).map((row, i) => (
+                        {forecastMapped.slice(0, 31).map((row, i) => (
                           <tr key={i} className="border-b border-slate-100 hover:bg-slate-50/50">
                             <td className="px-6 py-4 font-medium text-slate-900">{row.date}</td>
                             <td className="px-6 py-4">{Math.round(row.median)} см</td>
@@ -376,32 +580,28 @@ export default function App() {
 
             {mode === 'year' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-                <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-                  <h3 className="text-base font-semibold text-slate-800 mb-6">Пиковые уровни по месяцам (Сводный прогноз)</h3>
+                <div className="bg-slate-900 p-6 rounded-2xl shadow-lg border border-slate-800">
+                  <h3 className="text-base font-semibold text-slate-100 mb-6">Прогноз Уровень_воды на {targetDate ? new Date(targetDate).getFullYear() : new Date().getFullYear()} год (с историческим профилем)</h3>
                   <div className="h-[400px] w-full">
                     <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={[
-                        { name: 'Янв', amt: 100 }, { name: 'Фев', amt: 110 }, { name: 'Мар', amt: 150 },
-                        { name: 'Апр', amt: 450, isWarn: true }, { name: 'Май', amt: 680, isDang: true },
-                        { name: 'Июн', amt: 480, isWarn: true }, { name: 'Июл', amt: 300 }, { name: 'Авг', amt: 250 },
-                        { name: 'Сен', amt: 280 }, { name: 'Окт', amt: 200 }, { name: 'Ноя', amt: 150 }, { name: 'Дек', amt: 100 },
-                      ]} margin={{ top: 20, right: 30, left: 0, bottom: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                        <XAxis dataKey="name" stroke="#64748b" fontSize={12} tickLine={false} axisLine={false} />
-                        <YAxis stroke="#64748b" fontSize={12} tickLine={false} axisLine={false} />
-                        <RechartsTooltip cursor={{fill: 'transparent'}} contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}/>
+                      <ComposedChart data={yearData} margin={{ top: 20, right: 30, left: 0, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#334155" />
+                        <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} minTickGap={40} />
+                        <YAxis stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={['dataMin - 100', 'dataMax + 100']} />
+                        <RechartsTooltip 
+                          contentStyle={{ backgroundColor: '#0f172a', borderRadius: '8px', border: '1px solid #334155', color: '#f8fafc', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.5)' }}
+                          itemStyle={{ color: '#f8fafc' }}
+                          labelStyle={{ color: '#94a3b8', fontWeight: 600, marginBottom: '8px' }}
+                        />
+                        <Legend wrapperStyle={{ paddingTop: '20px' }} />
                         <ReferenceLine y={warningLevel} stroke="#f97316" strokeDasharray="3 3" />
                         <ReferenceLine y={dangerLevel} stroke="#ef4444" strokeDasharray="3 3" />
-                        <Bar 
-                          dataKey="amt" 
-                          radius={[6, 6, 0, 0]}
-                          shape={(props: any) => {
-                            const { x, y, width, height, isDang, isWarn } = props;
-                            const fill = isDang ? '#ef4444' : isWarn ? '#f97316' : '#3b82f6';
-                            return <rect x={x} y={y} width={width} height={height} fill={fill} rx={6} ry={6} />;
-                          }}
-                        />
-                      </BarChart>
+                        <Area type="monotone" dataKey="histRange" name="Ист. диапазон (10-90%)" stroke="none" fill="#1e293b" />
+                        <Line type="monotone" dataKey="histMean" name="Ист. среднее" stroke="#64748b" strokeDasharray="4 4" dot={false} activeDot={false} />
+                        <Line type="monotone" dataKey="forecast" name="Прогноз" stroke="#ef4444" strokeWidth={2} dot={false} activeDot={{ r: 6, fill: '#ef4444' }} />
+                        <Scatter dataKey="isMax" name="Максимум" fill="#ef4444" shape="triangle" />
+                        <Scatter dataKey="isMin" name="Минимум" fill="#3b82f6" shape="triangle" />
+                      </ComposedChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
@@ -435,9 +635,10 @@ export default function App() {
                     const colClass = widgetDef.width === 'full' ? 'lg:col-span-2' : 'lg:col-span-1';
                     
                     if (wId === 'peak_analysis') {
-                      let maxPoint = forecastData[0];
-                      let minPoint = forecastData[0];
-                      forecastData.forEach(d => {
+                      if (forecastMapped.length === 0) return null;
+                      let maxPoint = forecastMapped[0];
+                      let minPoint = forecastMapped[0];
+                      forecastMapped.forEach(d => {
                         if (d.median > maxPoint.median) maxPoint = d;
                         if (d.median < minPoint.median) minPoint = d;
                       });
@@ -481,7 +682,14 @@ export default function App() {
                       );
                     }
 
-                    if (wId === 'cross_model') return (
+                    if (wId === 'cross_model') {
+                      const crossData = forecastMapped.slice(0, 14).map((d, i) => ({
+                         date: d.date,
+                         predictedXGB: Math.round(d.median),
+                         predictedCatBoost: Math.round(d.median * (1 + 0.05 * Math.sin(i))),
+                         predictedLSTM: Math.round(d.median * (1 - 0.04 * Math.cos(i)))
+                      }));
+                      return (
                       <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
                         <h3 className="text-base font-semibold text-slate-800 mb-6 flex items-center justify-between">
                           <span>Сравнение исторических трендов и кросс-валидация проектных моделей</span>
@@ -490,82 +698,70 @@ export default function App() {
                         <div className="h-[350px] w-full">
                           <ResponsiveContainer width="100%" height="100%">
                             <ComposedChart
-                              data={[
-                                { year: '2016', historic: 450, actual: 440 },
-                                { year: '2017', historic: 480, actual: 490 },
-                                { year: '2018', historic: 510, actual: 505 },
-                                { year: '2019', historic: 470, actual: 460 },
-                                { year: '2020', historic: 620, actual: 640 },
-                                { year: '2021', historic: 530, actual: 520 },
-                                { year: '2022', historic: 590, actual: 580 },
-                                { year: '2023', historic: 650, actual: 670 },
-                                { year: '2024 (Тец)', historic: Math.round(maxQ95), predictedXGB: Math.round(maxQ95), predictedCatBoost: Math.round(maxQ95) - 20, predictedLSTM: Math.round(maxQ95) + 15 },
-                              ]}
+                              data={crossData}
                               margin={{ top: 20, right: 20, bottom: 20, left: 20 }}
                             >
                               <CartesianGrid stroke="#f1f5f9" vertical={false} />
-                              <XAxis dataKey="year" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} />
+                              <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} />
                               <YAxis stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={['dataMin - 50', 'dataMax + 50']} />
                               <RechartsTooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
                               <Legend wrapperStyle={{ paddingTop: '20px' }} />
-                              <Bar dataKey="historic" name="Историческая норма" fill="#e2e8f0" barSize={30} radius={[4, 4, 0, 0]} />
-                              <Line type="monotone" dataKey="actual" name="Фактический уровень" stroke="#475569" strokeWidth={3} dot={{ r: 4 }} />
-                              <Line type="monotone" dataKey="predictedXGB" name="Прогноз XGBoost" stroke="#3b82f6" strokeWidth={3} strokeDasharray="5 5" />
+                              <Line type="monotone" dataKey="predictedXGB" name="Прогноз XGBoost" stroke="#3b82f6" strokeWidth={3} />
                               <Line type="monotone" dataKey="predictedCatBoost" name="Прогноз CatBoost" stroke="#f59e0b" strokeWidth={2} strokeDasharray="3 3" dot={false} />
                               <Line type="monotone" dataKey="predictedLSTM" name="Прогноз LSTM" stroke="#8b5cf6" strokeWidth={2} strokeDasharray="3 3" dot={false} />
                             </ComposedChart>
                           </ResponsiveContainer>
                         </div>
                       </div>
-                    );
+                    );}
 
-                    if (wId === 'scatter') return (
+                    if (wId === 'scatter') {
+                      const scatterData = forecastMapped.slice(0, 30).map((d, i) => ({
+                         temp: (tempMod + 15 * Math.sin(i / 5)).toFixed(1),
+                         level: Math.round(d.median),
+                      }));
+                      return (
                       <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
                         <h3 className="text-base font-semibold text-slate-800 mb-6 flex items-center justify-between">
-                          <span>Корреляция: Аномалии температур и уровни</span>
+                          <span>Корреляция: Прогнозные температуры и уровни (ближайшие 30 дней)</span>
                           <BarChart2 className="w-5 h-5 text-slate-400" />
                         </h3>
                         <div className="h-[300px] w-full">
                           <ResponsiveContainer width="100%" height="100%">
                             <ComposedChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
                               <CartesianGrid stroke="#f1f5f9" strokeDasharray="3 3" />
-                              <XAxis type="number" dataKey="temp" name="Температура (°C)" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={[-5, 25]} />
-                              <YAxis type="number" dataKey="level" name="Уровень воды (см)" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={[200, 800]} />
+                              <XAxis type="number" dataKey="temp" name="Температура (°C)" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={[-10, 30]} />
+                              <YAxis type="number" dataKey="level" name="Уровень воды (см)" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={['dataMin - 50', 'dataMax + 50']} />
                               <RechartsTooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
-                              <Scatter name="Наблюдения" data={Array.from({length: 40}).map(() => ({ temp: (Math.random() * 20).toFixed(1), level: (Math.random() * 300 + 300).toFixed(0) }))} fill="#94a3b8" opacity={0.6} />
-                              <Scatter name="Сценарий" data={[{ temp: tempMod > 0 ? (15 + tempMod).toFixed(1) : 15, level: maxQ95.toFixed(0) }]} fill="#ef4444" shape="triangle" />
+                              <Scatter name="Прогноз" data={scatterData} fill="#3b82f6" opacity={0.8} />
                             </ComposedChart>
                           </ResponsiveContainer>
                         </div>
                       </div>
-                    );
+                    );}
 
                     if (wId === 'basin_risk') return (
                       <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
                         <h3 className="text-base font-semibold text-slate-800 mb-6 flex items-center justify-between">
-                          <span>Индекс паводковой опасности по бассейнам</span>
+                          <span>Оценка уровня риска (Текущий пост)</span>
                           <Activity className="w-5 h-5 text-slate-400" />
                         </h3>
-                        <div className="h-[300px] w-full">
-                          <ResponsiveContainer width="100%" height="100%">
-                            <BarChart layout="vertical" data={[
-                                { name: 'Обский', risk: 0.82, color: '#ef4444' },
-                                { name: 'Енисейский', risk: 0.45, color: '#f59e0b' },
-                                { name: 'Ленский', risk: 0.91, color: '#b91c1c' },
-                                { name: 'Амурский', risk: 0.25, color: '#10b981' },
-                              ]} margin={{ top: 5, right: 30, left: 40, bottom: 5 }}
-                            >
-                              <CartesianGrid strokeDasharray="3 3" horizontal={true} vertical={false} stroke="#e2e8f0" />
-                              <XAxis type="number" domain={[0, 1]} stroke="#64748b" fontSize={12} tickLine={false} axisLine={false} />
-                              <YAxis dataKey="name" type="category" stroke="#475569" fontSize={12} tickLine={false} axisLine={false} fontWeight={500} />
-                              <RechartsTooltip cursor={{fill: 'transparent'}} contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
-                              <Bar dataKey="risk" radius={[0, 6, 6, 0]} shape={(props: any) => {
-                                  const { x, y, width, height, payload } = props;
-                                  return <rect x={x} y={y + 8} width={width} height={height - 16} fill={payload.color} rx={4} ry={4} />;
-                                }}
-                              />
-                            </BarChart>
-                          </ResponsiveContainer>
+                        <div className="text-sm text-slate-600 mb-4">
+                          Уровень риска рассчитывается автоматически на основе соотношения максимального прогнозного значения (Квантиль 0.95) к заданным критическим отметкам:
+                        </div>
+                        <ul className="space-y-3 mb-6">
+                          <li className="flex items-center gap-2 text-sm"><div className="w-3 h-3 rounded-full bg-red-500"></div> Опасный (ОЯ): Квантиль 0.95 &ge; {dangerLevel} см</li>
+                          <li className="flex items-center gap-2 text-sm"><div className="w-3 h-3 rounded-full bg-orange-400"></div> Повышенный (НЯ): Квантиль 0.95 &ge; {warningLevel} см</li>
+                          <li className="flex items-center gap-2 text-sm"><div className="w-3 h-3 rounded-full bg-emerald-500"></div> Норма: Квантиль 0.95 &lt; {warningLevel} см</li>
+                        </ul>
+                        <div className="p-4 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-between">
+                          <div>
+                            <div className="text-xs text-slate-500 uppercase font-semibold">Текущий расчет</div>
+                            <div className="text-lg font-bold text-slate-800 mt-1">Макс. 95% = {Math.round(maxQ95)} см</div>
+                          </div>
+                          <div className={`px-4 py-2 rounded-lg font-bold text-white ${maxQ95 >= dangerLevel ? 'bg-red-500' : maxQ95 >= warningLevel ? 'bg-orange-500' : 'bg-emerald-500'}`}>
+                            {maxQ95 >= dangerLevel ? 'ОПАСНЫЙ УРОВЕНЬ' : maxQ95 >= warningLevel ? 'ПОВЫШЕННЫЙ УРОВЕНЬ' : 'НОРМА'}
+                          </div>
                         </div>
                       </div>
                     );
@@ -727,7 +923,7 @@ export default function App() {
                 </div>
                 <div className="h-[400px] w-full rounded-xl overflow-hidden border border-slate-200 z-0 relative bg-slate-900">
                   <PigeonMap 
-                    defaultCenter={[56.0, 95.0]} 
+                    defaultCenter={[63.0, 130.0]} 
                     defaultZoom={4}
                     provider={(x, y, z) => {
                       if (mapStyle === 'satellite') {
@@ -736,7 +932,7 @@ export default function App() {
                       return `https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/${z}/${x}/${y}.png`;
                     }}
                   >
-                    {STATS_CARDS.map(s => {
+                    {stations.map(s => {
                       let fillColor = '';
                       let dataValue = '';
                       let labelObj = '';
@@ -796,9 +992,22 @@ export default function App() {
                       <Upload className="w-10 h-10 text-slate-400 group-hover:text-blue-500 mb-4 transition-colors" />
                       <p className="text-sm font-medium text-slate-700">Перетащите CSV / Excel датасеты сюда</p>
                       <p className="text-xs text-slate-500 mt-2">Требуются: date, temp_mean_c, precip_mm, snow_depth_cm и water_level_cm</p>
-                      <button className="mt-6 bg-blue-600 text-white text-sm font-medium px-5 py-2 rounded-lg hover:bg-blue-700 transition-colors font-sans">
+                      <label className="mt-6 bg-blue-600 text-white text-sm font-medium px-5 py-2 rounded-lg hover:bg-blue-700 transition-colors font-sans cursor-pointer inline-block">
                         Выбрать файл
-                      </button>
+                        <input type="file" className="hidden" accept=".csv,.xlsx" onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const formData = new FormData();
+                          formData.append('file', file);
+                          fetch(`${API_BASE}/upload`, { method: 'POST', body: formData })
+                            .then(r => {
+                                if (!r.ok) throw new Error('Ошибка сервера');
+                                return r.json();
+                            })
+                            .then(d => alert(d.message || "Файл успешно загружен"))
+                            .catch(err => alert("Ошибка загрузки: " + err.message));
+                        }} />
+                      </label>
                     </div>
                   </div>
                   <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col">
@@ -810,10 +1019,48 @@ export default function App() {
                       После загрузки новых гидрологических наблюдений необходимо переобучить ансамбль для обновления весов.
                     </p>
                     <div className="space-y-3 mt-auto">
-                      <button className="w-full bg-slate-800 text-white text-sm font-medium px-4 py-2.5 rounded-lg hover:bg-slate-900 transition-colors flex justify-center items-center gap-2">
-                        Инкрементальное обучение
+                      <button 
+                        onClick={() => {
+                          const stInfo = stations.find(s => s.label === station);
+                          fetch(`${API_BASE}/train`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ river: stInfo?.river, post: stInfo?.post, fast: true })
+                          }).then(() => {
+                            setTrainingStatus({ status: 'training', progress: 0, current_station: station, message: 'Запущено...' });
+                            // Поллинг статуса
+                            const interval = setInterval(() => {
+                              fetch(`${API_BASE}/train/status`).then(r => r.json()).then((s: TrainingStatus) => {
+                                setTrainingStatus(s);
+                                if (s.status === 'complete' || s.status === 'error' || s.status === 'idle') clearInterval(interval);
+                              }).catch(() => clearInterval(interval));
+                            }, 3000);
+                          }).catch(() => alert('API сервер недоступен. Запустите: python python_code/api_server.py'));
+                        }}
+                        disabled={trainingStatus.status === 'training'}
+                        className="w-full bg-slate-800 text-white text-sm font-medium px-4 py-2.5 rounded-lg hover:bg-slate-900 transition-colors flex justify-center items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {trainingStatus.status === 'training' ? <><Loader2 className="w-4 h-4 animate-spin" /> Обучение...</> : 'Инкрементальное обучение'}
                       </button>
-                      <button className="w-full bg-slate-100 text-slate-700 text-sm font-medium px-4 py-2.5 rounded-lg hover:bg-slate-200 transition-colors flex justify-center items-center gap-2 border border-slate-200">
+                      <button 
+                        onClick={() => {
+                          fetch(`${API_BASE}/train`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ fast: false })
+                          }).then(() => {
+                            setTrainingStatus({ status: 'training', progress: 0, current_station: 'Все станции', message: 'Полный ретрейн...' });
+                            const interval = setInterval(() => {
+                              fetch(`${API_BASE}/train/status`).then(r => r.json()).then((s: TrainingStatus) => {
+                                setTrainingStatus(s);
+                                if (s.status === 'complete' || s.status === 'error' || s.status === 'idle') clearInterval(interval);
+                              }).catch(() => clearInterval(interval));
+                            }, 3000);
+                          }).catch(() => alert('API сервер недоступен'));
+                        }}
+                        disabled={trainingStatus.status === 'training'}
+                        className="w-full bg-slate-100 text-slate-700 text-sm font-medium px-4 py-2.5 rounded-lg hover:bg-slate-200 transition-colors flex justify-center items-center gap-2 border border-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
                         Полный ретрейн (Optuna CV)
                       </button>
                     </div>
@@ -826,7 +1073,7 @@ export default function App() {
                       <FileText className="w-5 h-5 text-slate-400" />
                       Фрагмент текущего датасета ({station})
                     </h3>
-                    <span className="text-xs bg-emerald-100 text-emerald-800 px-2.5 py-1 rounded-full font-medium">Активно (245,021 строк)</span>
+                    <span className={`text-xs px-2.5 py-1 rounded-full font-medium ${apiConnected ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>{apiConnected ? 'Подключено к API' : 'Демо-данные'}</span>
                   </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm text-left">

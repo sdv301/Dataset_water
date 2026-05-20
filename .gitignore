@@ -6,3 +6,15 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Large datasets and generated databases (keep locally)
+*.db
+/data/
+
+# Aggregated meteo exports (exceed GitHub file size limits)
+Реки/Метеостанции_1.csv
+Реки/Метеостанции_2.csv
+
+# Python bytecode
+__pycache__/
+*.pyc
