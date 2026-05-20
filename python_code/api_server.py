@@ -324,7 +324,7 @@ def _run_training(river: Optional[str], post: Optional[str], fast: bool) -> None
             model_dir = _station_model_dir(r_name, p_name)
             model_dir.mkdir(parents=True, exist_ok=True)
 
-            predictor = FloodPredictor(models_dir=str(model_dir), db_path=str(DB_PATH))
+            predictor = FloodPredictor(models_dir=str(model_dir), db_path=str(_DB_PATH))
             if fast:
                 # Быстрый режим — ограничиваем горизонты
                 predictor.horizons = [1, 3, 7]

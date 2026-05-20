@@ -6,7 +6,7 @@ import {
 import { 
   Map, Activity, Calendar, LayoutDashboard, Settings2, 
   Thermometer, CloudRain, Snowflake, AlertOctagon, TrendingUp, AlertTriangle, Plus, X, BarChart2,
-  Database, Upload, RefreshCw, FileText, Loader2
+  Database, Upload, RefreshCw, FileText, Loader2, Crosshair
 } from 'lucide-react';
 import { Map as PigeonMap, Overlay } from 'pigeon-maps';
 import { format, addDays, subDays } from 'date-fns';
@@ -87,6 +87,23 @@ const generateMockData = (days: number, baseLevel: number, tempMod: number, prec
   });
 };
 
+function getRiverBounds(riverStations: StationInfo[]): { center: [number, number]; zoom: number } {
+  if (riverStations.length === 0) return { center: [63, 130], zoom: 4 };
+  const lat = riverStations.reduce((s, st) => s + st.lat, 0) / riverStations.length;
+  const lng = riverStations.reduce((s, st) => s + st.lng, 0) / riverStations.length;
+  const latSpan = Math.max(...riverStations.map(s => s.lat)) - Math.min(...riverStations.map(s => s.lat));
+  const lngSpan = Math.max(...riverStations.map(s => s.lng)) - Math.min(...riverStations.map(s => s.lng));
+  const span = Math.max(latSpan, lngSpan);
+  let zoom = 8;
+  if (riverStations.length > 1) {
+    if (span > 8) zoom = 4;
+    else if (span > 4) zoom = 5;
+    else if (span > 2) zoom = 6;
+    else zoom = 7;
+  }
+  return { center: [lat, lng], zoom };
+}
+
 const DEFAULT_STATIONS: StationInfo[] = [
   { label: 'Лена — Якутск', river: 'Лена', post: 'Якутск', lat: 62.0, lng: 129.7, risk: 'low', critical_oya: 827, low_oya: -115 },
   { label: 'Лена — Ленск', river: 'Лена', post: 'Ленск', lat: 60.72, lng: 114.95, risk: 'medium', critical_oya: 1760, low_oya: 75 },
@@ -103,6 +120,7 @@ export default function App() {
   const [station, setStation] = useState(DEFAULT_STATIONS[0].label);
   const [warningLevel, setWarningLevel] = useState(827);
   const [dangerLevel, setDangerLevel] = useState(1000);
+  const [minLevel, setMinLevel] = useState(DEFAULT_STATIONS[0].low_oya ?? 0);
   const [apiConnected, setApiConnected] = useState(false);
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ status: 'idle', progress: 0, current_station: '', message: '' });
   const [targetDate, setTargetDate] = useState<string>('');
@@ -116,6 +134,15 @@ export default function App() {
   
   const [mapStyle, setMapStyle] = useState<'scheme' | 'satellite'>('satellite');
   const [mapData, setMapData] = useState<'risk' | 'temp' | 'snow'>('risk');
+  const [mapCenter, setMapCenter] = useState<[number, number]>([63, 130]);
+  const [mapZoom, setMapZoom] = useState(4);
+
+  const centerOnRiver = useCallback((river: string) => {
+    const riverStations = stations.filter(s => s.river === river);
+    const { center, zoom } = getRiverBounds(riverStations);
+    setMapCenter(center);
+    setMapZoom(zoom);
+  }, [stations]);
 
   // Попытка подключения к API
   useEffect(() => {
@@ -150,6 +177,9 @@ export default function App() {
               setStations(newStations);
               setStation(newStations[0].label);
               if (newStations[0].critical_oya) setDangerLevel(newStations[0].critical_oya);
+              if (newStations[0].low_oya != null && !Number.isNaN(newStations[0].low_oya)) {
+                setMinLevel(newStations[0].low_oya);
+              }
             }
             setApiConnected(true);
           });
@@ -165,7 +195,17 @@ export default function App() {
       setDangerLevel(currentStation.critical_oya);
       setWarningLevel(Math.round(currentStation.critical_oya * 0.7));
     }
-  }, [station]);
+    if (currentStation?.low_oya != null && !Number.isNaN(currentStation.low_oya)) {
+      setMinLevel(currentStation.low_oya);
+    }
+  }, [station, currentStation?.critical_oya, currentStation?.low_oya]);
+
+  useEffect(() => {
+    if (currentStation) {
+      setMapCenter([currentStation.lat, currentStation.lng]);
+      setMapZoom(9);
+    }
+  }, [station, currentStation?.lat, currentStation?.lng]);
 
   useEffect(() => {
     if (!currentStation || !apiConnected) return;
@@ -250,7 +290,11 @@ export default function App() {
   }, [apiForecast, apiHistory, tempMod, precipMod, targetDate]);
 
   const maxQ95 = forecastMapped.length > 0 ? Math.max(...forecastMapped.map(d => d.q95)) : 0;
-  
+  const minForecastMedian = forecastMapped.length > 0
+    ? Math.min(...forecastMapped.map(d => d.median))
+    : 0;
+  const lowWaterAlert = forecastMapped.length > 0 && minForecastMedian < minLevel;
+
   const currentRisk = maxQ95 >= dangerLevel ? 'ОПАСНЫЙ (ОЯ)' : maxQ95 >= warningLevel ? 'ПОВЫШЕННЫЙ (НЯ)' : 'НИЗКИЙ';
   const riskColor = maxQ95 >= dangerLevel ? 'text-red-500' : maxQ95 >= warningLevel ? 'text-orange-500' : 'text-emerald-500';
 
@@ -346,6 +390,17 @@ export default function App() {
                   type="range" min="400" max="1000" step="10" 
                   value={dangerLevel} onChange={(e) => setDangerLevel(Number(e.target.value))}
                   className="w-full accent-red-600"
+                />
+              </div>
+              <div>
+                <div className="flex justify-between text-xs mb-1">
+                  <span className="text-slate-600">Минимальный (низкий ОЯ)</span>
+                  <span className="font-mono text-blue-600">{minLevel} см</span>
+                </div>
+                <input 
+                  type="range" min={-300} max={2000} step="10" 
+                  value={minLevel} onChange={(e) => setMinLevel(Number(e.target.value))}
+                  className="w-full accent-blue-500"
                 />
               </div>
             </div>
@@ -495,6 +550,7 @@ export default function App() {
                         />
                         <Legend verticalAlign="top" height={36}/>
                         
+                        <ReferenceLine y={minLevel} label={{ position: 'insideBottomLeft', value: 'Мин. ОЯ', fill: '#3b82f6', fontSize: 12, fontWeight: 'bold' }} stroke="#3b82f6" strokeDasharray="3 3" />
                         <ReferenceLine y={warningLevel} label={{ position: 'insideTopLeft', value: 'НЯ', fill: '#f97316', fontSize: 12, fontWeight: 'bold' }} stroke="#f97316" strokeDasharray="3 3" />
                         <ReferenceLine y={dangerLevel} label={{ position: 'insideTopLeft', value: 'ОЯ', fill: '#ef4444', fontSize: 12, fontWeight: 'bold' }} stroke="#ef4444" strokeDasharray="3 3" />
                         
@@ -594,6 +650,7 @@ export default function App() {
                           labelStyle={{ color: '#94a3b8', fontWeight: 600, marginBottom: '8px' }}
                         />
                         <Legend wrapperStyle={{ paddingTop: '20px' }} />
+                        <ReferenceLine y={minLevel} label={{ value: 'Мин. ОЯ', fill: '#3b82f6', fontSize: 11 }} stroke="#3b82f6" strokeDasharray="3 3" />
                         <ReferenceLine y={warningLevel} stroke="#f97316" strokeDasharray="3 3" />
                         <ReferenceLine y={dangerLevel} stroke="#ef4444" strokeDasharray="3 3" />
                         <Area type="monotone" dataKey="histRange" name="Ист. диапазон (10-90%)" stroke="none" fill="#1e293b" />
@@ -753,6 +810,7 @@ export default function App() {
                           <li className="flex items-center gap-2 text-sm"><div className="w-3 h-3 rounded-full bg-red-500"></div> Опасный (ОЯ): Квантиль 0.95 &ge; {dangerLevel} см</li>
                           <li className="flex items-center gap-2 text-sm"><div className="w-3 h-3 rounded-full bg-orange-400"></div> Повышенный (НЯ): Квантиль 0.95 &ge; {warningLevel} см</li>
                           <li className="flex items-center gap-2 text-sm"><div className="w-3 h-3 rounded-full bg-emerald-500"></div> Норма: Квантиль 0.95 &lt; {warningLevel} см</li>
+                          <li className="flex items-center gap-2 text-sm"><div className="w-3 h-3 rounded-full bg-blue-500"></div> Минимальный (низкий ОЯ): {minLevel} см{lowWaterAlert ? ` — прогноз ниже (${Math.round(minForecastMedian)} см)` : ''}</li>
                         </ul>
                         <div className="p-4 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-between">
                           <div>
@@ -919,12 +977,25 @@ export default function App() {
                         Спутник
                       </button>
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => centerOnRiver(currentStation.river)}
+                      className="text-xs px-3 py-1.5 rounded-lg font-medium border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 transition-colors flex items-center gap-1.5"
+                    >
+                      <Crosshair className="w-3.5 h-3.5 text-blue-500" />
+                      Центрировать: {currentStation.river}
+                    </button>
                   </div>
                 </div>
                 <div className="h-[400px] w-full rounded-xl overflow-hidden border border-slate-200 z-0 relative bg-slate-900">
                   <PigeonMap 
-                    defaultCenter={[63.0, 130.0]} 
-                    defaultZoom={4}
+                    center={mapCenter}
+                    zoom={mapZoom}
+                    animate
+                    onBoundsChanged={({ center, zoom }) => {
+                      setMapCenter(center);
+                      setMapZoom(zoom);
+                    }}
                     provider={(x, y, z) => {
                       if (mapStyle === 'satellite') {
                         return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
