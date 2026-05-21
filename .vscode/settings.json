@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/python_code/.venv/Scripts/python.exe",
+  "python.analysis.extraPaths": ["${workspaceFolder}/python_code"],
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "warning",
+    "reportMissingModuleSource": "none"
+  },
+  "python.terminal.activateEnvironment": true
+}

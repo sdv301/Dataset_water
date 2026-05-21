@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flood_predictor import FloodPredictor
 from model_registry import ModelRegistry
+import hydro_service as hs
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +130,7 @@ def train_station(
     models_dir: str,
     n_trials: int,
     timeout: int,
-    backend: str = "xgboost",
+    backend: str = "catboost",
 ) -> bool:
     """
     Обучение моделей для одной станции.
@@ -217,6 +218,11 @@ def train_station(
                     params=m.get("params", {}),
                 )
 
+    reg = hs.register_station_model(river, post)
+    if reg:
+        print(f"  [DB] Запись station_models: {reg.get('model_dir')}")
+        print(f"  [Git] {reg.get('git_add')}")
+
     elapsed = time.time() - start_time
     print(f"\n  [DONE] Завершено за {format_elapsed(elapsed)}")
 
@@ -267,9 +273,9 @@ def main():
     parser.add_argument(
         "--backend",
         type=str,
-        default="xgboost",
+        default="catboost",
         choices=["xgboost", "catboost"],
-        help="ML-бэкенд (по умолчанию: xgboost)",
+        help="ML-бэкенд (по умолчанию: catboost)",
     )
     parser.add_argument(
         "--db",

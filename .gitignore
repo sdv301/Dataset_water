@@ -11,6 +11,9 @@ coverage/
 *.db
 /data/
 
+# ML-модели — НЕ игнорируем: можно коммитить выбранные станции (см. models/README.md)
+# python_code/.venv/
+
 # Aggregated meteo exports (exceed GitHub file size limits)
 Реки/Метеостанции_1.csv
 Реки/Метеостанции_2.csv

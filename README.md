@@ -35,7 +35,7 @@
    ```bash
    npm run dev
    ```
-3. Откройте интерфейс (по умолчанию `http://localhost:3000`).
+3. Откройте интерфейс: `http://localhost:3547`.
 
 ### Что реализовано в интерфейсе?
 - **Главный экран (Прогноз на дату)**: Вероятностный гидрограф, где отображена Базовая линия (тренд) и вероятностные границы будущих уровней реки.
@@ -51,7 +51,8 @@
 
 ### 1. Установка Python зависимостей
 ```bash
-pip install pandas numpy xgboost optuna scikit-learn joblib fastapi uvicorn
+pip install -r python_code/requirements.txt
+# включает CatBoost (по умолчанию), XGBoost, Optuna, FastAPI
 ```
 
 ### 2. Запуск пайплайна локально

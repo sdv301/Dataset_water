@@ -27,7 +27,9 @@ ICE_CSV = EXPORT_DIR / "dannie_толщина_льда.csv"
 STATIONS_CSV = EXPORT_DIR / "dannie_гмс.csv"
 
 ML_FEATURES_DB = DATA_DIR / "ml_features.db"
-HYDRO_METEO_DB = DATA_DIR / "hydro_meteo.db"
+HYDRO_METEO_DB = PROJECT_ROOT / "Реки" / "hydro_meteo.db"
+if not HYDRO_METEO_DB.exists():
+    HYDRO_METEO_DB = DATA_DIR / "hydro_meteo.db"
 
 def safe_float(val):
     try:
@@ -192,6 +194,45 @@ def prepare_data(river_filter=None, stats_only=False):
     snow_df.dropna(subset=['date'], inplace=True)
     snow_df['snow_pct_norm'] = snow_df['snow_pct_norm'].apply(safe_float)
     snow_daily = snow_df.groupby(['river_basin', 'date']).agg({'snow_pct_norm': 'mean'}).reset_index()
+
+    # 4b. Толщина льда
+    print_step("Парсинг толщины льда")
+    ice_daily = pd.DataFrame()
+    if ICE_CSV.exists():
+        ice_df = pd.read_csv(ICE_CSV, encoding='utf-8')
+        ice_df.rename(columns={
+            'Гидрометеорологический пост': 'post',
+            'Наименование реки': 'river_ice',
+            'Год': 'year',
+            'Месяц': 'month',
+            'День': 'day',
+            'Толщина льда,см': 'ice_thickness_cm',
+        }, inplace=True)
+        ice_df['date'] = pd.to_datetime(ice_df[['year', 'month', 'day']], errors='coerce')
+        ice_df.dropna(subset=['date'], inplace=True)
+        ice_df['ice_thickness_cm'] = ice_df['ice_thickness_cm'].apply(safe_float)
+        ice_daily = ice_df.groupby(['post', 'date']).agg({'ice_thickness_cm': 'mean'}).reset_index()
+
+    # 4c. Температуры из hydro_meteo.db (опционально)
+    hydro_temp_daily = pd.DataFrame()
+    if HYDRO_METEO_DB.exists():
+        print_step("Загрузка температур из hydro_meteo.db")
+        try:
+            hconn = sqlite3.connect(HYDRO_METEO_DB)
+            hydro_temp_daily = pd.read_sql_query(
+                """
+                SELECT hs.river, hs.post_name AS post, ht.dt AS date, AVG(ht.temp) AS hydro_temp_mean
+                FROM hydro_temperatures ht
+                JOIN hydro_stations hs ON ht.gidro_num = hs.gidro_num
+                GROUP BY hs.river, hs.post_name, ht.dt
+                """,
+                hconn,
+            )
+            hconn.close()
+            if not hydro_temp_daily.empty:
+                hydro_temp_daily['date'] = pd.to_datetime(hydro_temp_daily['date'], errors='coerce')
+        except Exception as e:
+            print(f"  [!] hydro_meteo.db: {e}")
     
     # 5. Обработка по станциям и генерация фичей
     print_step("Генерация признаков (Feature Engineering)")
@@ -225,7 +266,10 @@ def prepare_data(river_filter=None, stats_only=False):
             cos_doy REAL,
             precip_sum_3d REAL,
             precip_sum_7d REAL,
-            precip_sum_14d REAL
+            precip_sum_14d REAL,
+            ice_thickness_cm REAL,
+            temp_anomaly REAL,
+            level_vs_oya_pct REAL
         )
     """)
     
@@ -284,6 +328,22 @@ def prepare_data(river_filter=None, stats_only=False):
             ts_df['snow_pct_norm'] = ts_df['snow_pct_norm'].ffill(limit=30)
         else:
             ts_df['snow_pct_norm'] = np.nan
+
+        if not ice_daily.empty:
+            st_ice = ice_daily[ice_daily['post'] == post]
+            if not st_ice.empty:
+                ts_df = pd.merge(ts_df, st_ice[['date', 'ice_thickness_cm']], on='date', how='left')
+        if 'ice_thickness_cm' not in ts_df.columns:
+            ts_df['ice_thickness_cm'] = np.nan
+
+        if not hydro_temp_daily.empty:
+            st_ht = hydro_temp_daily[
+                (hydro_temp_daily['river'] == river) & (hydro_temp_daily['post'] == post)
+            ]
+            if not st_ht.empty:
+                ts_df = pd.merge(ts_df, st_ht[['date', 'hydro_temp_mean']], on='date', how='left')
+                if 'temp_mean' in ts_df.columns and 'hydro_temp_mean' in ts_df.columns:
+                    ts_df['temp_mean'] = ts_df['temp_mean'].fillna(ts_df['hydro_temp_mean'])
             
         # Генерация фичей
         # 1. Лаги уровней
@@ -321,6 +381,19 @@ def prepare_data(river_filter=None, stats_only=False):
             ts_df['precip_sum_3d'] = np.nan
             ts_df['precip_sum_7d'] = np.nan
             ts_df['precip_sum_14d'] = np.nan
+
+        # Аномалия температуры и уровень vs ОЯ
+        if 'temp_mean' in ts_df.columns:
+            doy_mean = ts_df.groupby(ts_df['date'].dt.dayofyear)['temp_mean'].transform('mean')
+            ts_df['temp_anomaly'] = ts_df['temp_mean'] - doy_mean
+        else:
+            ts_df['temp_anomaly'] = np.nan
+
+        crit = row.get('critical_oya')
+        if crit and not pd.isna(crit) and crit != 0:
+            ts_df['level_vs_oya_pct'] = 100.0 * ts_df['water_level_cm'] / float(crit)
+        else:
+            ts_df['level_vs_oya_pct'] = np.nan
             
         ts_df['river'] = river
         ts_df['post'] = post

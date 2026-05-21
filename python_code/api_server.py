@@ -33,9 +33,12 @@ from pydantic import BaseModel, Field
 # Пути к данным и моделям (относительно этого файла)
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_DATA_DIR = _SCRIPT_DIR / ".." / "data"
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+_DATA_DIR = _PROJECT_ROOT / "data"
 _DB_PATH = _DATA_DIR / "ml_features.db"
-_MODELS_DIR = _SCRIPT_DIR / "models"
+_MODELS_DIR = _PROJECT_ROOT / "models"
+
+import hydro_service as hs
 
 # ---------------------------------------------------------------------------
 # Логирование
@@ -50,10 +53,20 @@ logger = logging.getLogger("hydropredict")
 # Импорт FloodPredictor (опционально — может отсутствовать)
 # ---------------------------------------------------------------------------
 try:
-    from flood_predictor import FloodPredictor
-except ImportError:
+    from flood_predictor import DEFAULT_BACKEND, FloodPredictor
+except ImportError as exc:
     FloodPredictor = None  # type: ignore
-    logger.warning("Модуль flood_predictor не найден. Используются заглушки.")
+    DEFAULT_BACKEND = "catboost"  # type: ignore
+    logger.warning("Модуль flood_predictor недоступен: %s", exc)
+else:
+    try:
+        import catboost  # noqa: F401
+
+        logger.info("CatBoost %s — бэкенд по умолчанию: %s", catboost.__version__, DEFAULT_BACKEND)
+    except ImportError:
+        logger.error(
+            "CatBoost не установлен. Выполните: pip install -r python_code/requirements.txt"
+        )
 
 # ---------------------------------------------------------------------------
 # Глобальный статус обучения
@@ -63,7 +76,18 @@ training_status: dict = {
     "progress": 0.0,
     "current_station": "",
     "message": "",
+    "step_detail": "",
+    "station_index": 0,
+    "stations_total": 0,
 }
+
+# Параметры Optuna (как в train_all.py)
+TRAIN_FAST_TRIALS = 5
+TRAIN_FAST_TIMEOUT = 45
+TRAIN_FULL_TRIALS = 12
+TRAIN_FULL_TIMEOUT = 90
+TRAIN_BATCH_TRIALS = 5
+TRAIN_BATCH_TIMEOUT = 45
 
 # ---------------------------------------------------------------------------
 # Pydantic-модели ответов
@@ -136,6 +160,7 @@ class TrainRequest(BaseModel):
     river: Optional[str] = None
     post: Optional[str] = None
     fast: bool = False
+    backend: str = "catboost"
 
 
 class TrainStarted(BaseModel):
@@ -150,6 +175,26 @@ class TrainStatus(BaseModel):
     progress: float
     current_station: str
     message: str
+    step_detail: str = ""
+    station_index: int = 0
+    stations_total: int = 0
+
+
+class TrainingHistoryItem(BaseModel):
+    """Запись журнала обучения."""
+    id: int
+    task_id: Optional[str] = None
+    started_at: str
+    finished_at: Optional[str] = None
+    river: Optional[str] = None
+    post: Optional[str] = None
+    scope: str
+    fast: bool
+    status: str
+    stations_total: int = 0
+    stations_trained: int = 0
+    stations_skipped: int = 0
+    message: Optional[str] = None
 
 
 class HorizonMetrics(BaseModel):
@@ -205,18 +250,11 @@ def _get_db() -> sqlite3.Connection:
 
 
 def _station_model_dir(river: str, post: str) -> Path:
-    """Путь к директории моделей станции."""
-    safe_name = f"{river}__{post}".replace(" ", "_").replace("/", "_")
-    return _MODELS_DIR / safe_name
+    return hs.station_model_dir(river, post)
 
 
 def _has_trained_model(river: str, post: str) -> bool:
-    """Проверяет, существуют ли обученные модели для станции."""
-    model_dir = _station_model_dir(river, post)
-    if not model_dir.exists():
-        return False
-    # Ищем хотя бы один .joblib файл
-    return any(model_dir.glob("*.joblib"))
+    return hs.has_trained_model(river, post)
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +308,25 @@ def _mock_feature_importance() -> dict[str, float]:
 # Фоновое обучение
 # ---------------------------------------------------------------------------
 
-def _run_training(river: Optional[str], post: Optional[str], fast: bool) -> None:
+def _run_training(
+    river: Optional[str],
+    post: Optional[str],
+    fast: bool,
+    task_id: str,
+    backend: str = "catboost",
+) -> None:
     """
     Запускает обучение в фоновом потоке.
-    Обновляет глобальный training_status.
+    Обновляет глобальный training_status и пишет историю в БД.
     """
     global training_status
+    history_id: Optional[int] = None
+    conn = None
+    trained = 0
+    skipped = 0
+
     try:
+        hs.ensure_training_schema()
         training_status.update(
             status="training", progress=0.0, current_station="", message="Подготовка…",
         )
@@ -288,10 +338,26 @@ def _run_training(river: Optional[str], post: Optional[str], fast: bool) -> None
             )
             return
 
+        backend = (backend or "catboost").lower().strip()
+        if backend not in ("catboost", "xgboost"):
+            training_status.update(
+                status="error", progress=0.0,
+                message=f"Недопустимый backend: {backend}",
+            )
+            return
+        if backend == "catboost":
+            try:
+                import catboost  # noqa: F401
+            except ImportError:
+                training_status.update(
+                    status="error", progress=0.0,
+                    message="CatBoost не установлен. pip install catboost>=1.2",
+                )
+                return
+
         conn = sqlite3.connect(str(_DB_PATH))
         conn.row_factory = sqlite3.Row
 
-        # Определяем список станций для обучения
         if river and post:
             stations = [{"river": river, "post": post}]
         elif river:
@@ -312,69 +378,171 @@ def _run_training(river: Optional[str], post: Optional[str], fast: bool) -> None
             conn.close()
             return
 
+        history_id = hs.start_training_run(task_id, river, post, fast, total)
+
+        if fast or total == 1:
+            n_trials, timeout = TRAIN_FAST_TRIALS, TRAIN_FAST_TIMEOUT
+            mode_label = "быстрое"
+        elif total <= 3:
+            n_trials, timeout = TRAIN_FULL_TRIALS, TRAIN_FULL_TIMEOUT
+            mode_label = "полное"
+        else:
+            n_trials, timeout = TRAIN_BATCH_TRIALS, TRAIN_BATCH_TIMEOUT
+            mode_label = "пакетное (ускоренное для многих станций)"
+
+        training_status.update(
+            stations_total=total,
+            message=(
+                f"Режим: {mode_label}, Optuna {n_trials} ит. × {timeout} с на модель. "
+                f"Станций: {total}. Ориентир: ~5–12 мин на станцию."
+            ),
+        )
+
         for idx, st in enumerate(stations):
             r_name, p_name = st["river"], st["post"]
             training_status.update(
-                progress=round(idx / total, 2),
+                progress=round(idx / total, 2) if total else 0.0,
+                station_index=idx + 1,
+                stations_total=total,
                 current_station=f"{r_name} — {p_name}",
-                message=f"Обучение станции {idx + 1}/{total}…",
+                step_detail="Загрузка данных…",
+                message=f"Станция {idx + 1}/{total}",
             )
 
-            # Извлекаем данные
-            model_dir = _station_model_dir(r_name, p_name)
-            model_dir.mkdir(parents=True, exist_ok=True)
-
-            predictor = FloodPredictor(models_dir=str(model_dir), db_path=str(_DB_PATH))
-            if fast:
-                # Быстрый режим — ограничиваем горизонты
-                predictor.horizons = [1, 3, 7]
+            predictor = FloodPredictor(
+                models_dir=str(_MODELS_DIR),
+                db_path=str(_DB_PATH),
+                backend=backend,
+            )
+            if fast or total > 1:
+                predictor.horizons = [1, 3, 7, 14, 30]
 
             try:
                 df = predictor.load_station_data(r_name, p_name)
             except Exception as e:
-                logger.warning(f"Error loading data: {e}")
+                logger.warning("Error loading data: %s", e)
+                skipped += 1
+                if history_id:
+                    hs.log_training_station(
+                        history_id, r_name, p_name, "error", message=str(e),
+                    )
                 continue
 
             if df.empty or len(df) < 60:
-                logger.warning("Недостаточно данных для %s — %s, пропуск.", r_name, p_name)
+                skipped += 1
+                if history_id:
+                    hs.log_training_station(
+                        history_id, r_name, p_name, "skipped",
+                        rows_count=len(df), message="Недостаточно данных (<60 дней)",
+                    )
                 continue
 
             target_col = "water_level_cm"
             if target_col not in df.columns:
-                logger.warning("Нет целевого столбца '%s' для %s — %s.", target_col, r_name, p_name)
+                skipped += 1
+                if history_id:
+                    hs.log_training_station(
+                        history_id, r_name, p_name, "skipped",
+                        message=f"Нет столбца {target_col}",
+                    )
                 continue
 
-            # Убираем нецелевые столбцы (river, post, …)
             drop_cols = [c for c in ["river", "post"] if c in df.columns]
             df_train = df.drop(columns=drop_cols)
+            station_ok = False
+            station_msg = ""
 
-            predictor.train(df_train, target_col=target_col)
+            def _on_step(detail: str, frac: float) -> None:
+                training_status.update(
+                    step_detail=detail,
+                    progress=round(min(0.99, (idx + frac) / total), 3) if total else 0.0,
+                )
 
-            # Сохраняем манифест модели
-            manifest = {
-                "river": r_name,
-                "post": p_name,
-                "trained_at": datetime.datetime.now().isoformat(),
-                "n_samples": len(df_train),
-                "horizons": predictor.horizons,
-                "fast": fast,
-            }
-            with open(model_dir / "manifest.json", "w", encoding="utf-8") as f:
-                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            try:
+                predictor.train(
+                    df_train,
+                    target_col=target_col,
+                    n_trials=n_trials,
+                    timeout=timeout,
+                    on_progress=_on_step,
+                )
+                station_ok = True
+            except UnicodeEncodeError:
+                manifest_path = hs.station_model_dir(r_name, p_name) / "manifest.json"
+                if manifest_path.exists():
+                    station_ok = True
+                    station_msg = "Модель сохранена (предупреждение кодировки консоли)"
+                else:
+                    station_msg = str(UnicodeEncodeError)
+            except Exception as e:
+                station_msg = str(e)
+                logger.exception("Ошибка обучения %s — %s", r_name, p_name)
+
+            if station_ok and _has_trained_model(r_name, p_name):
+                trained += 1
+                reg = hs.register_station_model(r_name, p_name)
+                if reg:
+                    training_status.update(
+                        step_detail=f"Сохранено: {reg.get('model_dir')} ({reg.get('n_model_files')} файлов)",
+                    )
+                if history_id:
+                    hs.log_training_station(
+                        history_id, r_name, p_name, "success",
+                        rows_count=len(df_train),
+                        message=station_msg or f"OK → {reg.get('model_dir', 'models/')}",
+                    )
+            else:
+                skipped += 1
+                if history_id:
+                    hs.log_training_station(
+                        history_id, r_name, p_name, "error",
+                        rows_count=len(df_train), message=station_msg or "Модель не создана",
+                    )
+
+            training_status.update(
+                progress=round((idx + 1) / total, 2),
+                step_detail="Станция завершена",
+            )
+
+        if trained == 0 and skipped > 0:
+            final_status = "error"
+            msg = f"Ни одна станция не обучена ({skipped} пропущено/ошибок из {total})."
+        elif skipped > 0:
+            final_status = "partial"
+            msg = f"Обучено {trained} из {total} станций ({skipped} пропущено)."
+        else:
+            final_status = "success"
+            msg = f"Обучение завершено: {trained} станций."
+
+        if history_id:
+            hs.finish_training_run(history_id, final_status, msg, trained, skipped)
 
         training_status.update(
             status="complete", progress=1.0,
             current_station="",
-            message=f"Обучение завершено для {total} станций.",
+            message=msg,
         )
-        conn.close()
+        if conn:
+            conn.close()
 
     except Exception as exc:
         logger.exception("Ошибка при обучении.")
+        if history_id:
+            try:
+                hs.finish_training_run(
+                    history_id, "error", str(exc), trained, skipped,
+                )
+            except Exception:
+                pass
         training_status.update(
             status="error", progress=0.0,
             message=str(exc),
         )
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +555,33 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
+def _reset_training_status_idle() -> None:
+    """Сброс статуса при старте API — обучение только по POST /api/train."""
+    global training_status
+    training_status.update(
+        status="idle",
+        progress=0.0,
+        current_station="",
+        message="",
+        step_detail="",
+        station_index=0,
+        stations_total=0,
+    )
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _reset_training_status_idle()
+    try:
+        hs.ensure_training_schema()
+    except Exception as e:
+        logger.warning("Схема training_history: %s", e)
+
 # CORS — для связки с React-фронтендом
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
+    allow_origins=["http://localhost:3547", "http://localhost:3000", "http://localhost:3001", "http://localhost:5173", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -409,6 +600,28 @@ async def _startup_check() -> None:
         )
     # Создаём каталог моделей если отсутствует
     _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------- Служебные -------------------------------
+
+@app.get("/api/health")
+async def health_check():
+    """Проверка, что API запущен и БД доступна."""
+    return {
+        "ok": True,
+        "db": _DB_PATH.exists(),
+        "db_path": str(_DB_PATH),
+        "predictor_loaded": FloodPredictor is not None,
+    }
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "HydroPredict API",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
 
 
 # ----------------------------- Реки ----------------------------------
@@ -523,126 +736,167 @@ async def get_forecast(
         post=post, river=river, critical_oya=critical_oya, low_oya=low_oya,
     )
 
-    model_dir = _station_model_dir(river, post)
-    is_mock = True
-    forecast_points: list[dict] = []
+    try:
+        bd = datetime.date.fromisoformat(base_date) if base_date else None
+    except ValueError:
+        bd = None
 
-    # Попытка использовать реальные модели
-    if FloodPredictor is not None and model_dir.exists() and _has_trained_model(river, post):
-        try:
-            predictor = FloodPredictor(models_dir=str(model_dir))
-            import joblib
-            # Загружаем модели
-            for h in predictor.horizons:
-                for q in predictor.quantiles:
-                    fp = model_dir / f"model_h{h}_q{int(q * 100)}.joblib"
-                    if fp.exists():
-                        predictor.models.setdefault(h, {})[q] = joblib.load(str(fp))
+    try:
+        tier_data = hs.tier_forecast(river, post, "medium", days=days, base_date=bd)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена. Запустите prepare_ml_data.py")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-            features_path = model_dir / "features.joblib"
-            if features_path.exists():
-                predictor.features = joblib.load(str(features_path))
+    if tier_data["is_mock"]:
+        tier_data["forecast"] = _generate_mock_forecast(days, base_level=400.0)
 
-            if base_date:
-                try:
-                    today = datetime.date.fromisoformat(base_date)
-                except ValueError:
-                    today = datetime.date.today()
-            else:
-                conn_d = _get_db()
-                try:
-                    cur_d = conn_d.execute("SELECT MAX(date) as md FROM daily_features WHERE river=? AND post=?", (river, post))
-                    row_d = cur_d.fetchone()
-                    if row_d and dict(row_d).get("md"):
-                        today = datetime.date.fromisoformat(dict(row_d)["md"])
-                    else:
-                        today = datetime.date.today()
-                finally:
-                    conn_d.close()
-            for i in range(days):
-                target_date = today + datetime.timedelta(days=i)
-                # Ближайший доступный горизонт
-                available = [h for h in predictor.horizons if h >= (i + 1)]
-                use_h = available[0] if available else predictor.horizons[-1]
-
-                res = predictor.predict(
-                    today, use_h,
-                    warning_level=low_oya,
-                    danger_level=critical_oya,
-                )
-                if res:
-                    forecast_points.append({
-                        "date": target_date.isoformat(),
-                        "median": round(float(res.get("median", 0)), 2),
-                        "q10": round(float(res.get("median", 0)) * 0.85, 2),
-                        "q90": round(float(res.get("q90", 0)), 2),
-                        "q95": round(float(res.get("q95", 0)), 2),
-                    })
-            if forecast_points:
-                is_mock = False
-        except Exception:
-            logger.exception("Ошибка при прогнозировании моделью, используем заглушку.")
-            forecast_points = []
-
-    # Мок-данные если моделей нет или произошла ошибка
-    if not forecast_points:
-        forecast_points = _generate_mock_forecast(days, base_level=400.0)
-        is_mock = True
-
-    # Расчёт сводки рисков
-    max_q95 = max(p["q95"] for p in forecast_points) if forecast_points else 0.0
-    if max_q95 >= critical_oya:
-        current_risk = "ОПАСНЫЙ (ОЯ)"
-        prob_warning = 0.95
-        prob_danger = 0.60
-    elif max_q95 >= low_oya:
-        current_risk = "ПОВЫШЕННЫЙ (НЯ)"
-        prob_warning = 0.55
-        prob_danger = 0.10
-    else:
-        current_risk = "НИЗКИЙ"
-        prob_warning = 0.05
-        prob_danger = 0.01
-
+    forecast_points = tier_data["forecast"]
+    rs = tier_data["risk_summary"]
     risk_summary = RiskSummary(
-        max_q95=round(max_q95, 2),
-        current_risk=current_risk,
-        prob_warning=round(prob_warning, 3),
-        prob_danger=round(prob_danger, 3),
+        max_q95=rs["max_q95"],
+        current_risk=rs["current_risk"],
+        prob_warning=rs["prob_warning"],
+        prob_danger=rs["prob_danger"],
     )
-
-    feature_importance = _mock_feature_importance()
-
-    # Если модели реальные — пытаемся вытащить реальную важность
-    if not is_mock and FloodPredictor is not None:
-        try:
-            import joblib as _jl
-            features_path = model_dir / "features.joblib"
-            if features_path.exists():
-                feat_names = _jl.load(str(features_path))
-                # Берём медианную модель с горизонтом 7
-                m7_path = model_dir / "model_h7_q50.joblib"
-                if m7_path.exists():
-                    m7 = _jl.load(str(m7_path))
-                    importances = m7.feature_importances_
-                    if len(importances) == len(feat_names):
-                        pairs = sorted(
-                            zip(feat_names, importances),
-                            key=lambda x: x[1], reverse=True,
-                        )
-                        feature_importance = {
-                            n: round(float(v), 4) for n, v in pairs[:15]
-                        }
-        except Exception:
-            pass  # Используем мок
+    fi = tier_data.get("feature_importance") or _mock_feature_importance()
 
     return ForecastResponse(
         station=station_meta,
-        forecast=[ForecastPoint(**p) for p in forecast_points],
+        forecast=[ForecastPoint(**{k: p[k] for k in ("date", "median", "q10", "q90", "q95") if k in p}) for p in forecast_points],
         risk_summary=risk_summary,
-        feature_importance=feature_importance,
-        is_mock=is_mock,
+        feature_importance=fi,
+        is_mock=tier_data["is_mock"],
     )
+
+
+def _tier_response(river: str, post: str, tier: str, days: int, base_date: Optional[str] = None) -> dict:
+    try:
+        bd = datetime.date.fromisoformat(base_date) if base_date else None
+    except ValueError:
+        bd = None
+    try:
+        data = hs.tier_forecast(river, post, tier, days=days, base_date=bd)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена. Запустите prepare_ml_data.py")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if data["is_mock"] or not data.get("forecast"):
+        st = hs.get_station_row(river, post) or {}
+        base_lvl = float(st.get("low_oya") or 400.0) + float(st.get("critical_oya") or 650.0) / 2
+        data["forecast"] = _generate_mock_forecast(days, base_level=base_lvl)
+        data["is_mock"] = True
+        if not data.get("forecast_note"):
+            data["forecast_error"] = (
+                "Нет модели или горизонтов 14–30 — показан демо-прогноз. "
+                "Обучите станцию в разделе «Управление данными»."
+            )
+    return data
+
+
+@app.get("/api/forecast/{river}/{post}/short")
+async def get_forecast_short(
+    river: str, post: str,
+    days: int = Query(7, ge=1, le=30),
+    base_date: str = Query(None),
+):
+    return _tier_response(river, post, "short", days, base_date)
+
+
+@app.get("/api/forecast/{river}/{post}/medium")
+async def get_forecast_medium(
+    river: str, post: str,
+    days: int = Query(30, ge=1, le=120),
+    base_date: str = Query(None),
+):
+    return _tier_response(river, post, "medium", days, base_date)
+
+
+@app.get("/api/forecast/{river}/{post}/season")
+async def get_forecast_season(
+    river: str, post: str,
+    days: int = Query(90, ge=30, le=180),
+    base_date: str = Query(None),
+):
+    return _tier_response(river, post, "season", days, base_date)
+
+
+@app.get("/api/stations/{river}/{post}/model-status")
+async def get_station_model_status(river: str, post: str):
+    """Статус модели и последнее обучение для станции."""
+    try:
+        return hs.get_station_model_status(river, post)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/climatology/{river}/{post}")
+async def get_climatology(
+    river: str, post: str,
+    year: int = Query(None, description="Исключить год из статистики"),
+):
+    try:
+        return {"river": river, "post": post, "points": hs.compute_climatology(river, post, exclude_year=year)}
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+
+
+@app.get("/api/forecast/{river}/{post}/scenarios")
+async def get_forecast_scenarios(
+    river: str,
+    post: str,
+    days: int = Query(30, ge=7, le=90),
+    temp_delta: float = Query(0, description="Сдвиг температуры, °C"),
+    precip_pct: float = Query(100, ge=0, le=300, description="Осадки, % от нормы"),
+    snow_pct: float = Query(100, ge=0, le=300, description="Снег, % от нормы"),
+):
+    try:
+        return hs.build_scenario_forecasts(
+            river, post, days=days,
+            temp_delta=temp_delta, precip_pct=precip_pct, snow_pct=snow_pct,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/forecast/{river}/{post}/year")
+async def get_forecast_year(
+    river: str,
+    post: str,
+    year: int = Query(None),
+    overlay_years: int = Query(3, ge=0, le=8, description="Число экстремальных лет для overlay"),
+):
+    if year is None or year <= 0:
+        try:
+            year = hs.get_default_display_year(river, post)
+        except (FileNotFoundError, ValueError):
+            year = datetime.date.today().year
+    try:
+        return hs.build_year_analytics(river, post, year, overlay_years=overlay_years)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/explain/{river}/{post}")
+async def get_explain(
+    river: str, post: str,
+    horizon: int = Query(7, ge=1, le=90),
+    base_date: str = Query(None),
+):
+    try:
+        bd = datetime.date.fromisoformat(base_date) if base_date else None
+    except ValueError:
+        bd = None
+    try:
+        return hs.build_explanation(river, post, base_date=bd, horizon=horizon)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
 
 
 # ----------------------------- История --------------------------------
@@ -724,9 +978,16 @@ async def start_training(body: TrainRequest):
         )
 
     task_id = str(uuid.uuid4())
+    train_backend = (body.backend or "catboost").lower().strip()
+    if train_backend not in ("catboost", "xgboost"):
+        raise HTTPException(
+            status_code=400,
+            detail="backend должен быть «catboost» или «xgboost»",
+        )
+
     thread = threading.Thread(
         target=_run_training,
-        args=(body.river, body.post, body.fast),
+        args=(body.river, body.post, body.fast, task_id, train_backend),
         daemon=True,
     )
     thread.start()
@@ -738,6 +999,51 @@ async def start_training(body: TrainRequest):
 async def get_train_status():
     """Текущий статус фонового обучения."""
     return TrainStatus(**training_status)
+
+
+@app.get("/api/train/history", response_model=list[TrainingHistoryItem])
+async def get_train_history(limit: int = Query(30, ge=1, le=200)):
+    """Журнал запусков обучения из БД."""
+    try:
+        rows = hs.get_training_history(limit=limit)
+        return [
+            TrainingHistoryItem(
+                id=r["id"],
+                task_id=r.get("task_id"),
+                started_at=r["started_at"],
+                finished_at=r.get("finished_at"),
+                river=r.get("river"),
+                post=r.get("post"),
+                scope=r["scope"],
+                fast=bool(r.get("fast")),
+                status=r["status"],
+                stations_total=r.get("stations_total") or 0,
+                stations_trained=r.get("stations_trained") or 0,
+                stations_skipped=r.get("stations_skipped") or 0,
+                message=r.get("message"),
+            )
+            for r in rows
+        ]
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+
+
+@app.post("/api/train/reset-status")
+async def reset_train_status():
+    """Сбросить индикатор обучения в UI (после просмотра результата)."""
+    global training_status
+    if training_status["status"] == "training":
+        raise HTTPException(status_code=409, detail="Обучение ещё выполняется")
+    training_status.update(
+        status="idle",
+        progress=0.0,
+        current_station="",
+        message="",
+        step_detail="",
+        station_index=0,
+        stations_total=0,
+    )
+    return {"ok": True}
 
 
 # ----------------------------- Метрики модели -------------------------
@@ -757,21 +1063,30 @@ async def get_metrics(river: str, post: str):
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    # Формируем метрики — заглушки, пока нет реальных из CV
-    horizons_list = manifest.get("horizons", [1, 3, 7, 14, 30])
     horizons_dict: dict[str, HorizonMetrics] = {}
-    for h in horizons_list:
-        # Масштаб ошибок растёт с горизонтом
-        scale = math.log(h + 1) / math.log(2)
-        horizons_dict[str(h)] = HorizonMetrics(
-            rmse=round(12.0 * scale, 2),
-            mae=round(8.5 * scale, 2),
-            pinball=round(4.2 * scale, 2),
-        )
+    raw_metrics = manifest.get("metrics", {})
+    for h_key, q_dict in raw_metrics.items():
+        if not isinstance(q_dict, dict):
+            continue
+        q50 = q_dict.get("0.5") or q_dict.get(0.5)
+        if q50:
+            horizons_dict[str(h_key)] = HorizonMetrics(
+                rmse=float(q50.get("rmse", 0)),
+                mae=float(q50.get("mae", 0)),
+                pinball=float(q50.get("pinball_loss", 0)),
+            )
+    if not horizons_dict:
+        for h in manifest.get("horizons", [1, 3, 7, 14, 30]):
+            scale = math.log(h + 1) / math.log(2)
+            horizons_dict[str(h)] = HorizonMetrics(
+                rmse=round(12.0 * scale, 2),
+                mae=round(8.5 * scale, 2),
+                pinball=round(4.2 * scale, 2),
+            )
 
     return MetricsResponse(
         horizons=horizons_dict,
-        trained_at=manifest.get("trained_at", "unknown"),
+        trained_at=manifest.get("training_date", manifest.get("trained_at", "unknown")),
         n_samples=manifest.get("n_samples", 0),
     )
 
@@ -859,9 +1174,12 @@ async def upload_data_file(file: UploadFile = File(...)):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # reload=False: сохранение model_*.joblib не перезапускает API и не рвёт сессию в браузере
+    _reload = os.environ.get("UVICORN_RELOAD", "").lower() in ("1", "true", "yes")
     uvicorn.run(
         "api_server:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=_reload,
+        reload_excludes=["models", "data", "*.db", "*.joblib"] if _reload else None,
     )

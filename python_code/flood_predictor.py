@@ -3,7 +3,7 @@
 Модуль прогнозирования паводков (HydroPredict).
 
 Вероятностное прогнозирование уровня воды методами квантильной регрессии
-с использованием XGBoost и опционально CatBoost.
+с использованием CatBoost (по умолчанию) и XGBoost.
 """
 
 import os
@@ -13,18 +13,22 @@ import datetime
 import warnings
 from pathlib import Path
 from datetime import timedelta
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Callable
 
 import joblib
 import numpy as np
 import pandas as pd
-import optuna
+import optuna  # type: ignore[import-untyped]
+from catboost import CatBoostRegressor  # type: ignore[import-untyped]
 from xgboost import XGBRegressor
 from sklearn.model_selection import TimeSeriesSplit, train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+DEFAULT_BACKEND = "catboost"
+VALID_BACKENDS = ("catboost", "xgboost")
 
 
 # ---------------------------------------------------------------------------
@@ -37,15 +41,6 @@ def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, q: float) -> float:
     return float(np.mean(np.where(delta >= 0, q * delta, (q - 1) * delta)))
 
 
-def _lazy_import_catboost():
-    """Ленивый импорт CatBoost — не падаем, если пакет не установлен."""
-    try:
-        from catboost import CatBoostRegressor
-        return CatBoostRegressor
-    except ImportError:
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Основной класс
 # ---------------------------------------------------------------------------
@@ -55,8 +50,8 @@ class FloodPredictor:
     Класс для вероятностного прогнозирования уровня воды.
 
     Поддерживает:
+    - CatBoost quantile regression (по умолчанию)
     - XGBoost quantile regression (reg:quantileerror)
-    - CatBoost quantile regression (опционально)
     - Оптимизацию гиперпараметров через Optuna
     - Загрузку данных из SQLite-базы
     - Сохранение/загрузку моделей с манифестом
@@ -77,14 +72,14 @@ class FloodPredictor:
         "delta_1d", "delta_3d", "delta_7d",
         "day_of_year", "month", "sin_doy", "cos_doy",
         "precip_sum_3d", "precip_sum_7d", "precip_sum_14d",
-        "temp_anomaly",
+        "temp_anomaly", "level_vs_oya_pct",
     ]
 
     def __init__(
         self,
         models_dir: str = "models",
         db_path: str = "data/ml_features.db",
-        backend: str = "xgboost",
+        backend: str = DEFAULT_BACKEND,
         horizons: Optional[List[int]] = None,
         quantiles: Optional[List[float]] = None,
     ):
@@ -94,13 +89,17 @@ class FloodPredictor:
         Args:
             models_dir: Корневая директория для хранения моделей.
             db_path: Путь к SQLite-базе с фичами.
-            backend: «xgboost» или «catboost».
+            backend: «catboost» (по умолчанию) или «xgboost».
             horizons: Горизонты прогноза (дни).
             quantiles: Целевые квантили.
         """
         self.models_dir = models_dir
         self.db_path = db_path
-        self.backend = backend.lower()
+        self.backend = backend.lower().strip()
+        if self.backend not in VALID_BACKENDS:
+            raise ValueError(
+                f"Неизвестный backend={backend!r}. Допустимо: {', '.join(VALID_BACKENDS)}"
+            )
         self.horizons = horizons or self.DEFAULT_HORIZONS
         self.quantiles = quantiles or self.DEFAULT_QUANTILES
 
@@ -276,12 +275,6 @@ class FloodPredictor:
             Лучшие гиперпараметры.
         """
         use_catboost = self.backend == "catboost"
-        CatBoostRegressor = None
-        if use_catboost:
-            CatBoostRegressor = _lazy_import_catboost()
-            if CatBoostRegressor is None:
-                print("  [!] CatBoost не установлен, используем XGBoost.")
-                use_catboost = False
 
         sample_weights_full = self._calculate_sample_weights(y, X)
 
@@ -393,6 +386,7 @@ class FloodPredictor:
         target_col: str = "water_level_cm",
         n_trials: int = 15,
         timeout: int = 180,
+        on_progress: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         """
         Обучение моделей для всех горизонтов и квантилей.
@@ -402,6 +396,7 @@ class FloodPredictor:
             target_col: Название колонки с уровнем воды.
             n_trials: Число итераций Optuna.
             timeout: Таймаут Optuna (секунды).
+            on_progress: Колбэк (подпись шага, доля 0..1 внутри станции).
         """
         self.features = [
             c for c in data.columns
@@ -410,63 +405,69 @@ class FloodPredictor:
         self.metrics = {}
 
         use_catboost = self.backend == "catboost"
-        CatBoostRegressor = None
-        if use_catboost:
-            CatBoostRegressor = _lazy_import_catboost()
-            if CatBoostRegressor is None:
-                print("[!] CatBoost не установлен, переключаемся на XGBoost.")
-                use_catboost = False
-                self.backend = "xgboost"
 
+        plan: List[Tuple[int, float]] = []
         for h in self.horizons:
+            if len(data) > h + 30:
+                for q in self.quantiles:
+                    plan.append((h, q))
+        total_steps = max(len(plan), 1)
+
+        for step_i, (h, q) in enumerate(plan):
+            if on_progress:
+                on_progress(
+                    f"Горизонт {h} дн., квантиль {q} (Optuna до {n_trials} ит., {timeout} с)",
+                    step_i / total_steps,
+                )
             print(f"  Горизонт {h} дн.:")
-            if len(data) <= h + 30:
-                print(f"    ⚠ Недостаточно данных (нужно >{h + 30} строк). Пропуск.")
-                continue
-
             X, y = self._prepare_data(data, target_col, h)
-            self.models[h] = {}
-            self.metrics[h] = {}
+            if h not in self.models:
+                self.models[h] = {}
+            if h not in self.metrics:
+                self.metrics[h] = {}
 
-            for q in self.quantiles:
-                print(f"    Квантиль {q} ...", end=" ", flush=True)
-                best_params = self._optimize_params(X, y, q, n_trials, timeout)
+            print(f"    Квантиль {q} ...", end=" ", flush=True)
+            best_params = self._optimize_params(X, y, q, n_trials, timeout)
 
-                # Финальная тренировка на всех данных
-                if use_catboost:
-                    best_params["loss_function"] = f"Quantile:alpha={q}"
-                    best_params["random_seed"] = 42
-                    best_params["verbose"] = 0
-                    model = CatBoostRegressor(**best_params)
-                else:
-                    best_params["objective"] = "reg:quantileerror"
-                    best_params["quantile_alpha"] = q
-                    best_params["n_jobs"] = -1
-                    best_params["random_state"] = 42
-                    model = XGBRegressor(**best_params)
+            # Финальная тренировка на всех данных
+            if use_catboost:
+                best_params["loss_function"] = f"Quantile:alpha={q}"
+                best_params["random_seed"] = 42
+                best_params["verbose"] = 0
+                model = CatBoostRegressor(**best_params)
+            else:
+                best_params["objective"] = "reg:quantileerror"
+                best_params["quantile_alpha"] = q
+                best_params["n_jobs"] = -1
+                best_params["random_state"] = 42
+                model = XGBRegressor(**best_params)
 
-                weights = self._calculate_sample_weights(y, X)
-                model.fit(X, y, sample_weight=weights)
+            weights = self._calculate_sample_weights(y, X)
+            model.fit(X, y, sample_weight=weights)
 
-                self.models[h][q] = model
+            self.models[h][q] = model
 
-                # Расчёт метрик на обучающей выборке (in-sample)
-                preds = model.predict(X)
-                rmse = float(np.sqrt(mean_squared_error(y, preds)))
-                mae = float(mean_absolute_error(y, preds))
-                pbl = _pinball_loss(y.values, preds, q)
+            preds = model.predict(X)
+            rmse = float(np.sqrt(mean_squared_error(y, preds)))
+            mae = float(mean_absolute_error(y, preds))
+            pbl = _pinball_loss(y.values, preds, q)
 
-                self.metrics[h][q] = {
-                    "rmse": round(rmse, 2),
-                    "mae": round(mae, 2),
-                    "pinball_loss": round(pbl, 4),
-                    "params": best_params,
-                }
+            self.metrics[h][q] = {
+                "rmse": round(rmse, 2),
+                "mae": round(mae, 2),
+                "pinball_loss": round(pbl, 4),
+                "params": best_params,
+            }
 
-                print(f"RMSE={rmse:.1f}, MAE={mae:.1f}, PBL={pbl:.4f}")
+            print(f"RMSE={rmse:.1f}, MAE={mae:.1f}, PBL={pbl:.4f}")
 
-                # Сохранение модели
-                self._save_model(model, h, q, best_params)
+            self._save_model(model, h, q, best_params)
+
+            if on_progress:
+                on_progress(
+                    f"Горизонт {h} дн., квантиль {q} — готово",
+                    (step_i + 1) / total_steps,
+                )
 
         # Сохраняем список фичей
         model_dir = self._get_model_dir()
@@ -476,7 +477,7 @@ class FloodPredictor:
         # Сохраняем манифест
         self._save_manifest()
 
-        print("  ✓ Обучение завершено.")
+        print("  [OK] Obuchenie zaversheno.")
 
     # ------------------------------------------------------------------
     # Оценка (Evaluate)
@@ -567,9 +568,23 @@ class FloodPredictor:
         if df.empty:
             return None
 
-        # Оставляем только нужные фичи
-        available = [c for c in self.features if c in df.columns]
-        return df[available]
+        # Оставляем только нужные фичи в порядке обучения
+        if not self.features:
+            self.features = [
+                c for c in df.columns
+                if c not in ("date", "river", "post", "water_level_cm")
+            ]
+        row = {}
+        for c in self.features:
+            if c in df.columns:
+                val = df[c].iloc[0]
+                try:
+                    row[c] = float(val) if pd.notna(val) else 0.0
+                except (TypeError, ValueError):
+                    row[c] = 0.0
+            else:
+                row[c] = 0.0
+        return pd.DataFrame([row], columns=self.features)
 
     def predict(
         self,
@@ -852,6 +867,9 @@ class FloodPredictor:
                 manifest = json.load(f)
             self.horizons = manifest.get("horizons", self.DEFAULT_HORIZONS)
             self.quantiles = manifest.get("quantiles", self.DEFAULT_QUANTILES)
+            manifest_backend = manifest.get("backend")
+            if manifest_backend in VALID_BACKENDS:
+                self.backend = manifest_backend
 
         # Загрузка моделей
         self.models = {}
