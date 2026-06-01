@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port=3547 --host=0.0.0.0",
-    "api": "cd python_code && .venv\\Scripts\\python.exe api_server.py",
-    "train:station": "cd python_code && .venv\\Scripts\\python.exe train_station.py --river \"Лена\" --post \"Якутск\"",
+    "api": "cd python_code && python api_server.py",
+    "train:station": "cd python_code && python train_station.py --river \"Лена\" --post \"Якутск\"",
     "start": "concurrently -k \"npm run api\" \"npm run dev\"",
     "build": "vite build",
     "preview": "vite preview",
