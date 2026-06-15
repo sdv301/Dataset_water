@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+.github
+.env
+*.log
+.vscode
+# Large datasets are bind-mounted at runtime (docker-compose volumes)
+Реки
+models
+data
