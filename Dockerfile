@@ -38,16 +38,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 build-
 # ── 3. Production: Python API + Node static server ──
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates gnupg libgomp1 \
-    && mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
-       > /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends nodejs \
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Node.js копируем из frontend-build — без curl/nodesource (обход корпоративного SSL)
+COPY --from=frontend-build /usr/local/bin/node /usr/local/bin/node
+COPY --from=frontend-build /usr/local/bin/npm /usr/local/bin/npm
+COPY --from=frontend-build /usr/local/bin/npx /usr/local/bin/npx
+COPY --from=frontend-build /usr/local/lib/node_modules /usr/local/lib/node_modules
 
 WORKDIR /app
 
