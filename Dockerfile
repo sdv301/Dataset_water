@@ -12,8 +12,8 @@ COPY src ./src
 
 RUN npm run build
 
-# ── 2. Python ML/API dependencies ──
-FROM python:3.11-slim AS python-deps
+# ── 2. Python ML/API dependencies (полный образ — libgomp1 без apt-get) ──
+FROM python:3.11-bookworm AS python-deps
 
 WORKDIR /app
 
@@ -21,9 +21,7 @@ COPY python_code/requirements.txt ./python_code/requirements.txt
 
 ARG PIP_INDEX_URL=
 ENV PIP_TARGET=/opt/python-deps
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 build-essential \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p "$PIP_TARGET" \
+RUN mkdir -p "$PIP_TARGET" \
     && if [ -n "$PIP_INDEX_URL" ]; then \
          pip install --no-cache-dir --default-timeout=300 --target="$PIP_TARGET" -r python_code/requirements.txt -i "$PIP_INDEX_URL"; \
        else \
@@ -36,10 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 build-
        fi
 
 # ── 3. Production: Python API + Node static server ──
-FROM python:3.11-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+FROM python:3.11-bookworm
 
 # Node.js копируем из frontend-build — без curl/nodesource (обход корпоративного SSL)
 COPY --from=frontend-build /usr/local/bin/node /usr/local/bin/node
