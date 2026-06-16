@@ -8,8 +8,27 @@ ENV NODE_ENV=development
 ENV NPM_CONFIG_PRODUCTION=false
 
 COPY package.json package-lock.json ./
-RUN npm config set registry https://registry.npmmirror.com 2>/dev/null || true; \
-    npm ci --no-audit --no-fund || npm install --no-audit --no-fund; \
+RUN set -e; \
+    npm config set fetch-retries 15; \
+    npm config set fetch-retry-mintimeout 30000; \
+    npm config set fetch-retry-maxtimeout 180000; \
+    npm config set maxsockets 3; \
+    npm config set fund false; \
+    npm config set audit false; \
+    success=0; \
+    for reg in https://registry.npmjs.org https://registry.npmmirror.com; do \
+      echo "=== npm install via $reg ==="; \
+      npm config set registry "$reg"; \
+      rm -rf node_modules; \
+      if npm ci --no-audit --no-fund --loglevel error 2>/dev/null; then \
+        success=1; break; \
+      fi; \
+      rm -rf node_modules; \
+      if npm install --no-audit --no-fund --loglevel error; then \
+        success=1; break; \
+      fi; \
+    done; \
+    test "$success" -eq 1 || (echo "ERROR: npm install failed on all registries" && exit 1); \
     test -f node_modules/vite/bin/vite.js || (echo "ERROR: vite not installed" && npm ls vite && exit 1)
 
 COPY tsconfig.json vite.config.ts index.html metadata.json ./
