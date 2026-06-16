@@ -1177,7 +1177,7 @@ if __name__ == "__main__":
     # reload=False: сохранение model_*.joblib не перезапускает API и не рвёт сессию в браузере
     _reload = os.environ.get("UVICORN_RELOAD", "").lower() in ("1", "true", "yes")
     uvicorn.run(
-        "api_server:app",
+        app,
         host="0.0.0.0",
         port=8000,
         reload=_reload,

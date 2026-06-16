@@ -84,7 +84,7 @@ COPY server ./server
 COPY tsconfig.json ./tsconfig.json
 # data/, models/, Реки/ — bind-mount в docker-compose
 
-ENV PYTHONPATH=/opt/python-deps \
+ENV PYTHONPATH=/opt/python-deps:/app/python_code \
     PATH=/opt/python-deps/bin:$PATH
 
 EXPOSE 3547 8000
