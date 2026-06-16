@@ -8,25 +8,31 @@ ENV NODE_ENV=development
 ENV NPM_CONFIG_PRODUCTION=false
 
 COPY package.json package-lock.json ./
-RUN set -e; \
-    npm config set fetch-retries 15; \
+# npm 11 иногда падает с "Exit handler never called" на нестабильной сети
+RUN npm install -g npm@10 && \
+    set -e; \
+    npm config set fetch-retries 20; \
     npm config set fetch-retry-mintimeout 30000; \
-    npm config set fetch-retry-maxtimeout 180000; \
-    npm config set maxsockets 3; \
+    npm config set fetch-retry-maxtimeout 300000; \
+    npm config set maxsockets 2; \
     npm config set fund false; \
     npm config set audit false; \
     success=0; \
     for reg in https://registry.npmjs.org https://registry.npmmirror.com; do \
       echo "=== npm install via $reg ==="; \
       npm config set registry "$reg"; \
-      rm -rf node_modules; \
-      if npm ci --no-audit --no-fund --loglevel error 2>/dev/null; then \
-        success=1; break; \
-      fi; \
-      rm -rf node_modules; \
-      if npm install --no-audit --no-fund --loglevel error; then \
-        success=1; break; \
-      fi; \
+      for attempt in 1 2 3; do \
+        echo "--- attempt $attempt ---"; \
+        rm -rf node_modules; \
+        if npm ci --no-audit --no-fund --loglevel error 2>/dev/null; then \
+          success=1; break 2; \
+        fi; \
+        rm -rf node_modules; \
+        if npm install --no-audit --no-fund --loglevel error; then \
+          success=1; break 2; \
+        fi; \
+        sleep 5; \
+      done; \
     done; \
     test "$success" -eq 1 || (echo "ERROR: npm install failed on all registries" && exit 1); \
     test -f node_modules/vite/bin/vite.js || (echo "ERROR: vite not installed" && npm ls vite && exit 1)
