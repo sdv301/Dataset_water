@@ -66,11 +66,8 @@ RUN mkdir -p "$PIP_TARGET" \
 # ── 3. Production: Python API + Node static server ──
 FROM python:3.11-bookworm
 
-# Node.js копируем из frontend-build — без curl/nodesource (обход корпоративного SSL)
+# Только node binary — npm/npx ломаются при частичном копировании в python-образ
 COPY --from=frontend-build /usr/local/bin/node /usr/local/bin/node
-COPY --from=frontend-build /usr/local/bin/npm /usr/local/bin/npm
-COPY --from=frontend-build /usr/local/bin/npx /usr/local/bin/npx
-COPY --from=frontend-build /usr/local/lib/node_modules /usr/local/lib/node_modules
 
 WORKDIR /app
 
@@ -82,6 +79,8 @@ COPY --from=python-deps /opt/python-deps /opt/python-deps
 COPY python_code ./python_code
 COPY server ./server
 COPY tsconfig.json ./tsconfig.json
+COPY docker/start-prod.sh ./docker/start-prod.sh
+RUN chmod +x docker/start-prod.sh
 # data/, models/, Реки/ — bind-mount в docker-compose
 
 ENV PYTHONPATH=/opt/python-deps:/app/python_code \
@@ -89,4 +88,4 @@ ENV PYTHONPATH=/opt/python-deps:/app/python_code \
 
 EXPOSE 3547 8000
 
-CMD ["npm", "run", "start:prod"]
+CMD ["./docker/start-prod.sh"]
