@@ -3,14 +3,19 @@ FROM node:20-bookworm-slim AS frontend-build
 
 WORKDIR /app
 
-COPY package*.json ./
+# NODE_ENV=production on server skips dev tooling; force full install for vite build
+ENV NODE_ENV=development
+ENV NPM_CONFIG_PRODUCTION=false
+
+COPY package.json package-lock.json ./
 RUN npm config set registry https://registry.npmmirror.com 2>/dev/null || true; \
-    npm ci || npm install
+    npm ci --no-audit --no-fund || npm install --no-audit --no-fund; \
+    test -f node_modules/vite/bin/vite.js || (echo "ERROR: vite not installed" && npm ls vite && exit 1)
 
 COPY tsconfig.json vite.config.ts index.html metadata.json ./
 COPY src ./src
 
-RUN npm run build
+RUN node node_modules/vite/bin/vite.js build
 
 # ── 2. Python ML/API dependencies (полный образ — libgomp1 без apt-get) ──
 FROM python:3.11-bookworm AS python-deps
