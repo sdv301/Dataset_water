@@ -80,7 +80,8 @@ COPY python_code ./python_code
 COPY server ./server
 COPY tsconfig.json ./tsconfig.json
 COPY docker/start-prod.sh ./docker/start-prod.sh
-RUN chmod +x docker/start-prod.sh
+COPY docker/ensure-db.sh ./docker/ensure-db.sh
+RUN chmod +x docker/start-prod.sh docker/ensure-db.sh
 # data/, models/, Реки/ — bind-mount в docker-compose
 
 ENV PYTHONPATH=/opt/python-deps:/app/python_code \
