@@ -1,1 +1,8 @@
 @import "tailwindcss";
+
+/* Локальные SVG-иконки: явный размер и отображение без внешних шрифтов/CDN */
+svg[aria-hidden] {
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}

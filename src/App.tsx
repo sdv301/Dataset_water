@@ -3,11 +3,11 @@ import {
   LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, 
   BarChart, Bar, ResponsiveContainer, ReferenceLine, ReferenceDot, PieChart, Pie, Cell, ComposedChart, Scatter
 } from 'recharts';
-import { 
-  Map, Activity, Calendar, LayoutDashboard, Settings2, 
+import {
+  Map, Activity, Calendar, LayoutDashboard, Settings2,
   Thermometer, CloudRain, Snowflake, AlertOctagon, TrendingUp, AlertTriangle, Plus, X, BarChart2,
-  Database, Upload, RefreshCw, FileText, Loader2, Crosshair
-} from 'lucide-react';
+  Database, Upload, RefreshCw, FileText, Loader2, Crosshair,
+} from './components/icons';
 import { Map as PigeonMap, Overlay } from 'pigeon-maps';
 import { format, addDays, subDays } from 'date-fns';
 import { ru } from 'date-fns/locale';
@@ -18,7 +18,7 @@ import {
 } from './ForecastPanels';
 import { StationSearchSelect } from './components/StationSearchSelect';
 import { notifyTrainingFinished, requestTrainingNotifications } from './utils/trainingNotify';
-import { API_BASE } from './config';
+import { API_BASE, MAP_SATELLITE_TILES_URL, MAP_SCHEME_TILES_URL } from './config';
 
 // --- Types & API ---
 type ForecastMode = 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data';
@@ -146,6 +146,21 @@ export default function App() {
   const [dangerLevel, setDangerLevel] = useState(1000);
   const [minLevel, setMinLevel] = useState(DEFAULT_STATIONS[0].low_oya ?? 0);
   const [apiConnected, setApiConnected] = useState(false);
+  const [dbReady, setDbReady] = useState(false);
+  const [dbError, setDbError] = useState<string | null>(null);
+  const [dataStats, setDataStats] = useState<{
+    total_records?: number;
+    total_stations?: number;
+    date_range?: [string, string];
+  } | null>(null);
+  const [datasetRows, setDatasetRows] = useState<Array<{
+    date: string;
+    water_level_cm: number;
+    temp_mean?: number | null;
+    precip_mm?: number | null;
+    snow_depth_cm?: number | null;
+  }>>([]);
+  const [datasetLoading, setDatasetLoading] = useState(false);
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ status: 'idle', progress: 0, current_station: '', message: '' });
   const [trainingHistory, setTrainingHistory] = useState<TrainingHistoryRow[]>([]);
   const trainPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -230,8 +245,23 @@ export default function App() {
 
   useEffect(() => {
     fetch(`${API_BASE}/health`)
-      .then(r => setApiConnected(r.ok))
-      .catch(() => setApiConnected(false));
+      .then(async (r) => {
+        const data = await r.json().catch(() => ({}));
+        setApiConnected(!!r.ok && !!data.ok);
+        setDbReady(!!data.db);
+        setDbError(
+          data.db
+            ? null
+            : (data.db_path
+              ? `БД не найдена: ${data.db_path}. Запустите prepare_ml_data.py или загрузите CSV.`
+              : 'База данных недоступна'),
+        );
+      })
+      .catch(() => {
+        setApiConnected(false);
+        setDbReady(false);
+        setDbError('API недоступен — запустите npm run start или проверьте контейнер dataset-water');
+      });
     loadStationsFromApi();
   }, []);
 
@@ -248,11 +278,59 @@ export default function App() {
       .catch(() => setTrainingHistory([]));
   }, []);
 
-  useEffect(() => {
-    if (mode === 'data') fetchTrainingHistory();
-  }, [mode, fetchTrainingHistory]);
-
   const currentStation = stations.find(s => s.label === station) || stations[0];
+
+  const fetchDataStats = useCallback(() => {
+    fetch(`${API_BASE}/data/stats`)
+      .then(async (r) => {
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(typeof err.detail === 'string' ? err.detail : r.statusText);
+        }
+        return r.json();
+      })
+      .then((stats) => {
+        setDataStats(stats);
+        setDbReady(true);
+        setDbError(null);
+      })
+      .catch((e: Error) => {
+        setDataStats(null);
+        setDbError(e.message || 'Не удалось загрузить статистику БД');
+      });
+  }, []);
+
+  const fetchDatasetPreview = useCallback(() => {
+    if (!currentStation) return;
+    const encR = encodeURIComponent(currentStation.river);
+    const encP = encodeURIComponent(currentStation.post);
+    setDatasetLoading(true);
+    fetch(`${API_BASE}/history/${encR}/${encP}?days=30`)
+      .then(async (r) => {
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(typeof err.detail === 'string' ? err.detail : r.statusText);
+        }
+        return r.json();
+      })
+      .then((rows) => {
+        setDatasetRows(Array.isArray(rows) ? rows.slice(-10).reverse() : []);
+        setDbReady(true);
+        setDbError(null);
+      })
+      .catch((e: Error) => {
+        setDatasetRows([]);
+        setDbError(e.message || 'Не удалось загрузить данные станции');
+      })
+      .finally(() => setDatasetLoading(false));
+  }, [currentStation?.river, currentStation?.post]);
+
+  useEffect(() => {
+    if (mode !== 'data') return;
+    fetchTrainingHistory();
+    fetchDataStats();
+    fetchDatasetPreview();
+  }, [mode, fetchTrainingHistory, fetchDataStats, fetchDatasetPreview]);
 
   const fetchModelStatus = useCallback(() => {
     if (!currentStation) return;
@@ -743,7 +821,14 @@ export default function App() {
                 <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${apiConnected ? 'bg-emerald-400' : 'bg-amber-400'}`}></span>
                 <span className={`relative inline-flex rounded-full h-3 w-3 ${apiConnected ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
               </span>
-              <span className="text-sm font-medium text-slate-600">{apiConnected ? 'API подключён' : 'API недоступен — npm run start'}</span>
+              <span className="text-sm font-medium text-slate-600">
+                {apiConnected
+                  ? (dbReady ? 'API и БД подключены' : 'API работает, БД не готова')
+                  : 'API недоступен — npm run start'}
+              </span>
+              {dbError && apiConnected && !dbReady && (
+                <span className="text-xs text-amber-700 max-w-xs truncate" title={dbError}>{dbError}</span>
+              )}
             </div>
           </div>
         </header>
@@ -1239,9 +1324,15 @@ export default function App() {
                     }}
                     provider={(x, y, z) => {
                       if (mapStyle === 'satellite') {
-                        return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+                        return MAP_SATELLITE_TILES_URL
+                          .replace('{z}', String(z))
+                          .replace('{y}', String(y))
+                          .replace('{x}', String(x));
                       }
-                      return `https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/${z}/${x}/${y}.png`;
+                      return MAP_SCHEME_TILES_URL
+                        .replace('{z}', String(z))
+                        .replace('{x}', String(x))
+                        .replace('{y}', String(y));
                     }}
                   >
                     {stations.map(s => {
@@ -1288,12 +1379,42 @@ export default function App() {
                       );
                     })}
                   </PigeonMap>
+                  <div className="absolute bottom-2 left-2 right-2 text-[10px] text-white/90 bg-black/40 px-2 py-1 rounded pointer-events-none">
+                    {mapStyle === 'satellite'
+                      ? '© Esri, Maxar, Earthstar Geographics'
+                      : '© CARTO, © OpenStreetMap contributors'}
+                  </div>
                 </div>
               </div>
             )}
 
             {mode === 'data' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                {dataStats && (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                      <p className="text-xs text-slate-500 uppercase font-semibold">Записей в БД</p>
+                      <p className="text-2xl font-bold text-slate-800 mt-1">{dataStats.total_records?.toLocaleString('ru-RU') ?? '—'}</p>
+                    </div>
+                    <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                      <p className="text-xs text-slate-500 uppercase font-semibold">Станций</p>
+                      <p className="text-2xl font-bold text-slate-800 mt-1">{dataStats.total_stations ?? '—'}</p>
+                    </div>
+                    <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                      <p className="text-xs text-slate-500 uppercase font-semibold">Диапазон дат</p>
+                      <p className="text-sm font-semibold text-slate-800 mt-2">
+                        {dataStats.date_range?.[0] && dataStats.date_range?.[1]
+                          ? `${dataStats.date_range[0]} — ${dataStats.date_range[1]}`
+                          : '—'}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                {dbError && (
+                  <div className="bg-amber-50 border border-amber-200 text-amber-900 rounded-xl px-4 py-3 text-sm">
+                    {dbError}
+                  </div>
+                )}
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                   <div className="lg:col-span-2 bg-white rounded-2xl p-6 border border-slate-200 shadow-sm">
                     <h3 className="text-base font-semibold text-slate-800 mb-4 flex items-center gap-2">
@@ -1316,7 +1437,12 @@ export default function App() {
                                 if (!r.ok) throw new Error('Ошибка сервера');
                                 return r.json();
                             })
-                            .then(d => alert(d.message || "Файл успешно загружен"))
+                            .then(d => {
+                              alert(d.message || 'Файл успешно загружен');
+                              fetchDataStats();
+                              fetchDatasetPreview();
+                              loadStationsFromApi(station);
+                            })
                             .catch(err => alert("Ошибка загрузки: " + err.message));
                         }} />
                       </label>
@@ -1451,7 +1577,16 @@ export default function App() {
                       <FileText className="w-5 h-5 text-slate-400" />
                       Фрагмент текущего датасета ({station})
                     </h3>
-                    <span className={`text-xs px-2.5 py-1 rounded-full font-medium ${apiConnected ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>{apiConnected ? 'Подключено к API' : 'Демо-данные'}</span>
+                    <span className={`text-xs px-2.5 py-1 rounded-full font-medium ${dbReady ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+                      {datasetLoading ? 'Загрузка…' : dbReady ? 'Данные из БД' : 'БД недоступна'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => { fetchDataStats(); fetchDatasetPreview(); }}
+                      className="text-xs text-blue-600 hover:underline"
+                    >
+                      Обновить
+                    </button>
                   </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm text-left">
@@ -1466,19 +1601,19 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody>
-                        {[
-                          { d: '2024-05-18', l: 480, t: 14.5, p: 0.0, s: 0, st: 'Checked' },
-                          { d: '2024-05-19', l: 495, t: 16.2, p: 12.5, s: 0, st: 'Checked' },
-                          { d: '2024-05-20', l: 512, t: 18.0, p: 45.0, s: 0, st: 'New' },
-                        ].map((row, i) => (
-                          <tr key={i} className="border-b border-slate-100 hover:bg-slate-50/50">
-                            <td className="px-6 py-3 font-mono text-slate-800">{row.d}</td>
-                            <td className="px-6 py-3 text-blue-600 font-medium">{row.l}</td>
-                            <td className="px-6 py-3 text-slate-600">{row.t}</td>
-                            <td className="px-6 py-3 text-slate-600">{row.p}</td>
-                            <td className="px-6 py-3 text-slate-600">{row.s}</td>
+                        {datasetLoading ? (
+                          <tr><td colSpan={6} className="px-6 py-8 text-slate-500 text-center">Загрузка из API…</td></tr>
+                        ) : datasetRows.length === 0 ? (
+                          <tr><td colSpan={6} className="px-6 py-8 text-slate-500 text-center">Нет данных для станции — проверьте БД или загрузите CSV</td></tr>
+                        ) : datasetRows.map((row, i) => (
+                          <tr key={`${row.date}-${i}`} className="border-b border-slate-100 hover:bg-slate-50/50">
+                            <td className="px-6 py-3 font-mono text-slate-800">{row.date}</td>
+                            <td className="px-6 py-3 text-blue-600 font-medium">{row.water_level_cm}</td>
+                            <td className="px-6 py-3 text-slate-600">{row.temp_mean ?? '—'}</td>
+                            <td className="px-6 py-3 text-slate-600">{row.precip_mm ?? '—'}</td>
+                            <td className="px-6 py-3 text-slate-600">{row.snow_depth_cm ?? '—'}</td>
                             <td className="px-6 py-3">
-                              <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded-sm ${row.st === 'New' ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-600'}`}>{row.st}</span>
+                              <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-sm bg-emerald-100 text-emerald-700">DB</span>
                             </td>
                           </tr>
                         ))}

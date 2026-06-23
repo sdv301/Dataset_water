@@ -38,9 +38,14 @@ RUN npm install -g npm@10 && \
     test -f node_modules/vite/bin/vite.js || (echo "ERROR: vite not installed" && npm ls vite && exit 1)
 
 COPY tsconfig.json vite.config.ts index.html metadata.json ./
+COPY scripts ./scripts
 COPY src ./src
 
-RUN node node_modules/vite/bin/vite.js build
+# Prod: API и ассеты под /flood/v2/ (nginx → portal)
+ARG VITE_API_BASE=/flood/v2/api
+ENV VITE_API_BASE=${VITE_API_BASE}
+
+RUN node scripts/gen-icons.mjs && node node_modules/vite/bin/vite.js build
 
 # ── 2. Python ML/API dependencies (полный образ — libgomp1 без apt-get) ──
 FROM python:3.11-bookworm AS python-deps

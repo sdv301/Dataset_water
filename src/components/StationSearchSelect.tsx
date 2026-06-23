@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Search, ChevronDown, CheckCircle2, Circle } from 'lucide-react';
+import { Search, ChevronDown, CheckCircle2, Circle } from './icons';
 
 export interface StationOption {
   label: string;

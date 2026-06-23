@@ -6,7 +6,7 @@ import {
 } from 'recharts';
 import { format } from 'date-fns';
 import { ru } from 'date-fns/locale';
-import { AlertCircle, Info, ZoomIn } from 'lucide-react';
+import { AlertCircle, Info, ZoomIn } from './components/icons';
 import { QUANTILE_HELP_SHORT, QUANTILE_LABELS, QUANTILE_LEGEND_ITEMS } from './quantiles';
 
 export function QuantileLegend({ compact }: { compact?: boolean }) {

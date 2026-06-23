@@ -20,6 +20,7 @@ import datetime
 import threading
 import subprocess
 import shutil
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,7 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -613,6 +615,49 @@ async def health_check():
         "db_path": str(_DB_PATH),
         "predictor_loaded": FloodPredictor is not None,
     }
+
+
+def _fetch_tile_upstream(url: str) -> tuple[bytes, str]:
+    req = urllib.request.Request(url, headers={"User-Agent": "hydropredict/tile-proxy"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+        ct = resp.headers.get("Content-Type", "image/jpeg")
+    return data, ct
+
+
+@app.get("/api/tiles/arcgis/{z}/{y}/{x}")
+async def arcgis_tile(z: int, y: int, x: int):
+    """Esri World Imagery — © Esri, Maxar, Earthstar Geographics."""
+    if z < 0 or z > 22:
+        raise HTTPException(status_code=400, detail="Invalid zoom level")
+    extent = 2 ** z
+    if x < 0 or x >= extent or y < 0 or y >= extent:
+        raise HTTPException(status_code=400, detail="Tile out of range")
+    url = (
+        f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+        f"World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    )
+    try:
+        data, ct = _fetch_tile_upstream(url)
+        return Response(content=data, media_type=ct, headers={"Cache-Control": "public, max-age=86400"})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"ArcGIS tile fetch failed: {exc}") from exc
+
+
+@app.get("/api/tiles/carto/{z}/{x}/{y}")
+async def carto_tile(z: int, x: int, y: int):
+    """Carto Positron light scheme tiles (proxied)."""
+    if z < 0 or z > 22:
+        raise HTTPException(status_code=400, detail="Invalid zoom level")
+    extent = 2 ** z
+    if x < 0 or x >= extent or y < 0 or y >= extent:
+        raise HTTPException(status_code=400, detail="Tile out of range")
+    url = f"https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png"
+    try:
+        data, ct = _fetch_tile_upstream(url)
+        return Response(content=data, media_type=ct or "image/png", headers={"Cache-Control": "public, max-age=86400"})
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Carto tile fetch failed: {exc}") from exc
 
 
 @app.get("/")
