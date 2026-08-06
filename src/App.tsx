@@ -570,6 +570,13 @@ export default function App() {
             <h1 className="text-xl font-bold tracking-tight">HydroPredict</h1>
           </div>
           <p className="text-xs text-slate-500">Система вероятностного прогноза паводков</p>
+          <a
+            href="/dashboard.html"
+            className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-blue-600 border border-slate-200 hover:border-blue-300 bg-slate-50 hover:bg-blue-50 px-3 py-1.5 rounded-lg transition-colors"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+            На портал
+          </a>
         </div>
 
         <div className="p-4 flex-1 flex flex-col gap-6">
