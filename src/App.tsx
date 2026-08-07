@@ -202,13 +202,30 @@ export default function App() {
 
   const loadStationsFromApi = useCallback((preserveLabel?: string) => {
     return fetch(`${API_BASE}/rivers`)
-      .then(r => r.json())
+      .then(async (r) => {
+        if (!r.ok) {
+          const text = await r.text().catch(() => '');
+          console.error(`[HydroPredict] GET /rivers → ${r.status} ${r.statusText}`, text);
+          throw new Error(`API /rivers returned ${r.status}`);
+        }
+        return r.json();
+      })
       .then((rivers: any[]) => {
-        if (!rivers?.length) return;
+        if (!rivers?.length) {
+          console.warn('[HydroPredict] /rivers returned empty array');
+          return;
+        }
+        console.info(`[HydroPredict] Loaded ${rivers.length} rivers from API`);
         const fetchPosts = rivers.map(r =>
           fetch(`${API_BASE}/rivers/${encodeURIComponent(r.river)}/posts`)
-            .then(res => res.json())
-            .catch(() => [])
+            .then(async (res) => {
+              if (!res.ok) {
+                console.error(`[HydroPredict] GET /rivers/${r.river}/posts → ${res.status}`);
+                return [];
+              }
+              return res.json();
+            })
+            .catch((err) => { console.error(`[HydroPredict] posts fetch error for ${r.river}:`, err); return []; })
         );
         return Promise.all(fetchPosts).then(allPosts => {
           const newStations: StationInfo[] = [];
@@ -227,6 +244,7 @@ export default function App() {
               });
             });
           });
+          console.info(`[HydroPredict] Built ${newStations.length} stations from ${rivers.length} rivers`);
           if (newStations.length > 0) {
             setStations(newStations);
             const keep = preserveLabel && newStations.some(s => s.label === preserveLabel)
@@ -240,13 +258,18 @@ export default function App() {
           setApiConnected(true);
         });
       })
-      .catch(() => setApiConnected(false));
+      .catch((err) => {
+        console.error('[HydroPredict] loadStationsFromApi FAILED:', err);
+        setApiConnected(false);
+      });
   }, [station]);
 
   useEffect(() => {
+    console.info(`[HydroPredict] Startup — API_BASE="${API_BASE}", DEV=${import.meta.env.DEV}`);
     fetch(`${API_BASE}/health`)
       .then(async (r) => {
         const data = await r.json().catch(() => ({}));
+        console.info('[HydroPredict] /health →', r.status, data);
         setApiConnected(!!r.ok && !!data.ok);
         setDbReady(!!data.db);
         setDbError(
@@ -257,7 +280,8 @@ export default function App() {
               : 'База данных недоступна'),
         );
       })
-      .catch(() => {
+      .catch((err) => {
+        console.error('[HydroPredict] /health FAILED:', err);
         setApiConnected(false);
         setDbReady(false);
         setDbError('API недоступен — запустите npm run start или проверьте контейнер dataset-water');
@@ -609,7 +633,12 @@ export default function App() {
           </div>
 
           <div className="space-y-4">
-            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Локация</label>
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
+              Локация
+              <span className="ml-2 text-[10px] font-normal normal-case text-slate-400">
+                ({stations.length} станций{apiConnected ? '' : ' — offline'})
+              </span>
+            </label>
             <StationSearchSelect
               stations={stations}
               value={station}
