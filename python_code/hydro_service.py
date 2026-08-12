@@ -60,11 +60,69 @@ def has_trained_model(river: str, post: str) -> bool:
     return d.exists() and any(d.glob("model_h*.joblib"))
 
 
+# Ожидаемые колонки daily_features. Если их нет в старой БД — добавляем как NULL,
+# чтобы не падать с OperationalError: "no such column".
+# Список расширяем по мере ввода новых фич (снегозапас, ледоход, летние осадки и т.п.).
+_EXPECTED_DAILY_FEATURES_COLUMNS: Dict[str, str] = {
+    "ice_thickness_cm": "REAL",
+    "temp_anomaly": "REAL",
+    "level_vs_oya_pct": "REAL",
+    # Резерв под будущий пайплайн:
+    "snow_depth_cm": "REAL",       # высота снежного покрова, см
+    "swe_mm": "REAL",              # снегозапас (Snow Water Equivalent), мм
+    "precip_sum_30d": "REAL",
+    "precip_sum_60d": "REAL",
+    "precip_sum_90d": "REAL",
+    "ice_event": "TEXT",           # ледостав/шуга/вскрытие/ледоход
+    "is_summer": "INTEGER",        # флаг летнего сезона (июнь–август)
+}
+
+_SCHEMA_ENSURED = False
+
+
+def _ensure_daily_features_schema(conn: sqlite3.Connection) -> None:
+    """Идемпотентно добавляет отсутствующие колонки в daily_features.
+
+    SQLite `ALTER TABLE ADD COLUMN` дешёвый и безопасный: просто расширяет схему,
+    существующие строки получают NULL. Это фикс 500-й ошибки, когда БД была
+    построена старой версией `prepare_ml_data.py`.
+    """
+    global _SCHEMA_ENSURED
+    if _SCHEMA_ENSURED:
+        return
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(daily_features)").fetchall()}
+    except sqlite3.OperationalError:
+        # таблицы ещё нет — миграцию сделает prepare_ml_data.py
+        _SCHEMA_ENSURED = True
+        return
+    added: List[str] = []
+    for col, sql_type in _EXPECTED_DAILY_FEATURES_COLUMNS.items():
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE daily_features ADD COLUMN {col} {sql_type}")
+                added.append(col)
+            except sqlite3.OperationalError:
+                # гонка/уже добавлено — игнорим
+                pass
+    if added:
+        conn.commit()
+        try:
+            import logging
+            logging.getLogger(__name__).info(
+                "daily_features: добавлены колонки %s", ", ".join(added)
+            )
+        except Exception:
+            pass
+    _SCHEMA_ENSURED = True
+
+
 def get_db() -> sqlite3.Connection:
     if not DB_PATH.exists():
         raise FileNotFoundError(str(DB_PATH))
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    _ensure_daily_features_schema(conn)
     return conn
 
 

@@ -17,6 +17,8 @@ import {
   type YearChartFocus,
 } from './ForecastPanels';
 import { StationSearchSelect } from './components/StationSearchSelect';
+import { FloodAgentPanel } from './components/FloodAgentPanel';
+import { AgentAlertsBadge } from './components/AgentAlertsBadge';
 import { notifyTrainingFinished, requestTrainingNotifications } from './utils/trainingNotify';
 import { API_BASE, MAP_SATELLITE_TILES_URL, MAP_SCHEME_TILES_URL } from './config';
 
@@ -826,6 +828,7 @@ export default function App() {
             {mode === 'data' && 'Каталог данных и ретрейн моделей'}
           </h2>
           <div className="flex items-center gap-3">
+            <AgentAlertsBadge />
             {isMock && mode !== 'dashboards' && mode !== 'data' && mode !== 'norm' && (
               <span className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded-lg border border-amber-200">Демо / нет модели</span>
             )}
@@ -897,6 +900,13 @@ export default function App() {
             {(mode === 'short' || mode === 'season') && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
                 <ExplainPanel explain={explain} isMock={isMock} />
+                {currentStation && (
+                  <FloodAgentPanel
+                    river={currentStation.river}
+                    post={currentStation.post}
+                    horizon={mode === 'short' ? 7 : 14}
+                  />
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                   <div className="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
                     <p className="text-sm text-slate-500 mb-1">Базовая дата</p>
@@ -945,6 +955,13 @@ export default function App() {
             {mode === 'medium' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
                 <ExplainPanel explain={explain} isMock={isMock} />
+                {currentStation && (
+                  <FloodAgentPanel
+                    river={currentStation.river}
+                    post={currentStation.post}
+                    horizon={30}
+                  />
+                )}
                 <MediumForecastView
                   forecast={apiForecast}
                   tierPayload={tierPayload}
@@ -1396,6 +1413,7 @@ export default function App() {
                       const isSelected = s.label === station;
 
                       return (
+                        // @ts-expect-error pigeon-maps Overlay props типизация не включает React key
                         <Overlay key={s.label} anchor={[s.lat, s.lng]} offset={[isSelected ? 12 : 8, isSelected ? 12 : 8]}>
                           <div className="relative group cursor-pointer" onClick={() => setStation(s.label)}>
                             <div 

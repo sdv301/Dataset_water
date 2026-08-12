@@ -22,7 +22,7 @@ import subprocess
 import shutil
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import uvicorn
@@ -602,6 +602,13 @@ async def _startup_check() -> None:
         )
     # Создаём каталог моделей если отсутствует
     _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    # Запускаем планировщик агента (ночной автопрогон)
+    try:
+        import agent_scheduler
+        agent_scheduler.init_scheduler()
+        logger.info("Планировщик агента активирован")
+    except Exception as e:
+        logger.warning("Не удалось запустить планировщик агента: %s", e)
 
 
 # ----------------------------- Служебные -------------------------------
@@ -615,6 +622,253 @@ async def health_check():
         "db_path": str(_DB_PATH),
         "predictor_loaded": FloodPredictor is not None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Глобальный обработчик исключений — чтобы 500-ки не были «немыми».
+# ---------------------------------------------------------------------------
+from fastapi import Request  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error at %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Внутренняя ошибка сервера",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
+            "path": str(request.url.path),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# ИИ-агент прогноза паводка
+# ---------------------------------------------------------------------------
+
+from fastapi.responses import Response, JSONResponse  # noqa: E402
+
+@app.get("/api/agent/flood-risk/{river}/{post}")
+async def get_flood_risk_agent(
+    river: str,
+    post: str,
+    horizon: int = Query(14, ge=1, le=60, description="Горизонт оценки риска, дней"),
+    persist: bool = Query(True, description="Сохранять критический риск в alerts"),
+    fresh: bool = Query(False, description="Пересчитать сейчас (иначе — снапшот из ночного прогона)"),
+):
+    """Агент оценки риска паводка. По умолчанию отдаёт кеш из ночного прогона
+    (мгновенно). При `fresh=true` — пересчёт на лету."""
+    try:
+        from flood_agent import assess_flood_risk
+        import agent_scheduler
+        if not fresh:
+            snap = agent_scheduler.get_snapshot(river, post)
+            if snap and snap.get("horizon_days") == horizon:
+                age = snap.get("_snapshot_age_s")
+                return JSONResponse(content=snap,
+                                    headers={"X-Snapshot-Age": str(age) if age is not None else "-1",
+                                             "X-Source": "snapshot"})
+        result = assess_flood_risk(river, post, horizon=horizon, persist=persist)
+        try:
+            agent_scheduler.save_snapshot(river, post, result, horizon)
+        except Exception:
+            pass
+        return JSONResponse(content=result, headers={"X-Snapshot-Age": "0", "X-Source": "fresh"})
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# --- Планировщик агента ---------------------------------------------------
+
+@app.get("/api/agent/scheduler/status")
+async def agent_scheduler_status():
+    import agent_scheduler
+    return agent_scheduler.get_status()
+
+
+class _SchedRunPayload(BaseModel):
+    horizon: Optional[int] = None
+    background: bool = True
+
+
+@app.post("/api/agent/scheduler/run-now")
+async def agent_scheduler_run_now(payload: _SchedRunPayload = _SchedRunPayload()):
+    import agent_scheduler
+    return agent_scheduler.run_now(background=payload.background, horizon=payload.horizon)
+
+
+class _SchedConfigPayload(BaseModel):
+    hour: Optional[int] = None
+    minute: Optional[int] = None
+    enabled: Optional[bool] = None
+    horizon: Optional[int] = None
+
+
+@app.post("/api/agent/scheduler/config")
+async def agent_scheduler_config(payload: _SchedConfigPayload):
+    import agent_scheduler
+    try:
+        return agent_scheduler.update_config(
+            hour=payload.hour, minute=payload.minute,
+            enabled=payload.enabled, horizon=payload.horizon,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+
+@app.get("/api/agent/alerts")
+async def list_agent_alerts(
+    river: Optional[str] = Query(None),
+    post: Optional[str] = Query(None),
+    only_pending: bool = Query(False, description="Только неподтверждённые"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """Список сохранённых алертов агента (для профиля пользователя)."""
+    try:
+        from flood_agent import list_alerts
+        return {"items": list_alerts(river=river, post=post,
+                                     only_pending=only_pending, limit=limit)}
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+
+
+class _AckPayload(BaseModel):
+    user: Optional[str] = None
+
+
+@app.post("/api/agent/alerts/{alert_id}/acknowledge")
+async def acknowledge_agent_alert(alert_id: int, payload: _AckPayload = _AckPayload()):
+    """Пользователь подтверждает, что ознакомился с алертом."""
+    try:
+        from flood_agent import acknowledge_alert
+        return acknowledge_alert(alert_id, user=payload.user)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+class _BatchItem(BaseModel):
+    river: str
+    post: str
+
+
+class _BatchPayload(BaseModel):
+    items: List[_BatchItem] = Field(..., min_items=1, max_items=100)
+    horizon: int = Field(14, ge=1, le=60)
+    persist: bool = False
+
+
+@app.post("/api/agent/flood-risk/batch")
+async def post_flood_risk_batch(payload: _BatchPayload):
+    """Оценка агента сразу по списку станций (для профиля/дашборда).
+
+    `persist=False` по умолчанию: батч-опрос не должен спамить алертами.
+    Возвращает `results` (успехи) и `errors` (станции с ошибкой) отдельно —
+    один плохой пост не роняет остальных.
+    """
+    from flood_agent import assess_flood_risk
+
+    results: List[dict] = []
+    errors: List[dict] = []
+    for it in payload.items:
+        try:
+            results.append(
+                assess_flood_risk(it.river, it.post,
+                                  horizon=payload.horizon, persist=payload.persist)
+            )
+        except Exception as exc:  # noqa: BLE001 — сознательно ловим всё
+            errors.append({"river": it.river, "post": it.post,
+                           "error_type": type(exc).__name__, "error": str(exc)})
+    return {"count": len(results), "results": results, "errors": errors}
+
+
+@app.get("/api/agent/alerts/summary")
+async def get_agent_alerts_summary(
+    only_pending: bool = Query(True),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """Сводка для бейджа в профиле: сколько pending-алертов и по каким станциям.
+
+    Полезно на фронте: показать «⚠ 3» в шапке и открыть модалку со списком.
+    """
+    from flood_agent import list_alerts
+
+    items = list_alerts(only_pending=only_pending, limit=limit)
+    by_class: Dict[str, int] = {}
+    by_station: Dict[str, int] = {}
+    for a in items:
+        by_class[a.get("risk_class") or "unknown"] = by_class.get(a.get("risk_class") or "unknown", 0) + 1
+        key = f"{a.get('river')}/{a.get('post')}"
+        by_station[key] = by_station.get(key, 0) + 1
+    return {
+        "total": len(items),
+        "by_risk_class": by_class,
+        "by_station": by_station,
+        "requires_ack": sum(1 for a in items if not a.get("acknowledged")),
+        "latest": items[:10],
+    }
+
+
+class _FeedbackPayload(BaseModel):
+    river: str
+    post: str
+    verdict: str = Field(..., description="'reward' или 'penalty'")
+    alert_id: Optional[int] = None
+    actual_class: Optional[str] = None
+    comment: Optional[str] = None
+
+
+@app.post("/api/agent/feedback")
+async def post_agent_feedback(payload: _FeedbackPayload):
+    """Поощрение/наказание агента. Обновляет веса сработавших правил per-станция."""
+    try:
+        from flood_agent import record_feedback
+        return record_feedback(
+            river=payload.river,
+            post=payload.post,
+            verdict=payload.verdict,
+            alert_id=payload.alert_id,
+            actual_class=payload.actual_class,
+            comment=payload.comment,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/agent/analytics/{river}/{post}")
+async def get_agent_analytics(river: str, post: str, years: int = Query(10, ge=1, le=50)):
+    """Аналитика поста: пики по годам, климатология уровня, лёд, тренд."""
+    try:
+        from flood_agent import compute_station_analytics
+        return compute_station_analytics(river, post, years=years)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/agent/priority")
+async def get_agent_priority(limit: int = Query(20, ge=1, le=200)):
+    """Топ станций по «горячности» на основе snapshot-кеша (ночного прогона)."""
+    from flood_agent import station_priority
+    return {"items": station_priority(limit=limit)}
+
+
+@app.get("/api/agent/history/{river}/{post}")
+async def get_agent_history(river: str, post: str, days: int = Query(180, ge=7, le=1825)):
+    """Последние N дней с уровнями/температурой/осадками и списком превышений НЯ/ОЯ."""
+    try:
+        from flood_agent import compute_station_history
+        return compute_station_history(river, post, days=days)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 def _fetch_tile_upstream(url: str) -> tuple[bytes, str]:
