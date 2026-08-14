@@ -394,7 +394,8 @@ def _forecast_daily(
         st = hs.get_station_row(river, post) or {}
         low = float(st.get("low_oya") or 500)
         crit = float(st.get("critical_oya") or 650)
-        base = hs.get_latest_data_date(river, post)
+        latest = hs.get_latest_data_date(river, post)
+        base = max(latest, datetime.date.today())  # прогноз всегда от сегодня
         predictor = hs.load_predictor(river, post)
         if not predictor:
             return [], False
@@ -518,6 +519,20 @@ def assess_flood_risk(
     peak_median, peak_date = _peak_of(forecast_points)
     critical_days = _critical_days(forecast_points, low, crit)
 
+    # --- Свежесть данных (data_through + штраф уверенности) ---
+    data_through = hs.get_latest_data_date(river, post)
+    today = datetime.date.today()
+    data_lag_days = (today - data_through).days if data_through else None
+    stale_penalty = 0.0
+    stale_warning: Optional[str] = None
+    if data_lag_days is not None and data_lag_days > 7:
+        # Штраф растёт линейно: -0.05 за каждый день сверх 7, до -0.4 максимум
+        stale_penalty = min(0.4, 0.05 * (data_lag_days - 7))
+        stale_warning = (
+            f"Данные устарели на {data_lag_days} дн. (последние: {data_through}). "
+            f"Уверенность снижена на {int(round(stale_penalty * 100))}%."
+        )
+
     prob_warn = max((p.get("prob_warning") or 0) for p in forecast_points) if forecast_points else None
     prob_dang = max((p.get("prob_danger") or 0) for p in forecast_points) if forecast_points else None
 
@@ -555,12 +570,12 @@ def assess_flood_risk(
     verdict_red = (p_exceed_crit >= 0.85) or ((prob_dang or 0) >= 0.85 and len(drivers) >= 2)
     will_flood = verdict_red or verdict_yellow
     verdict_level = "red" if verdict_red else ("yellow" if verdict_yellow else "green")
-    verdict_confidence = round(min(1.0, max(
+    verdict_confidence = round(max(0.0, min(1.0, max(
         p_exceed_crit,
         p_exceed_low * 0.9,
         (prob_dang or 0),
         (prob_warn or 0) * 0.9,
-    )), 3)
+    ) - stale_penalty)), 3)
     verdict_reason_parts: List[str] = []
     if p_exceed_crit >= 0.5:
         verdict_reason_parts.append(f"q90 ≥ ОЯ в {days_q90_over_crit} из {horizon_len} дней")
@@ -634,6 +649,8 @@ def assess_flood_risk(
         parts.append(f"Для контекста: в {year - 1} г. лёд вскрывался ~{last_year_breakup}.")
     if not has_model:
         parts.append("Обученной ML-модели нет — оценка основана на правилах и климатологии.")
+    if stale_warning:
+        parts.append(stale_warning)
 
     result: Dict[str, Any] = {
         "river": river,
@@ -645,6 +662,9 @@ def assess_flood_risk(
         "risk_class": risk_class_en,
         "risk_class_ru": risk_class_ru,
         "has_model": has_model,
+        "data_through": data_through.isoformat() if data_through else None,
+        "data_lag_days": data_lag_days,
+        "stale_warning": stale_warning,
         "thresholds": {"low_oya": low, "critical_oya": crit},
         "forecast_peak": {
             "level_cm": peak_median,

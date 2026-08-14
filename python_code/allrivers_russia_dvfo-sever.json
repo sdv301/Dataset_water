@@ -1,0 +1,92 @@
+{
+  "summary": {
+    "region": "russia/dvfo-sever",
+    "total": 5,
+    "ok": 5,
+    "errors": 0,
+    "with_coords": 5,
+    "with_water_level": 5
+  },
+  "gauges": [
+    {
+      "river": "adycha",
+      "post": "yurdyuk-kumah",
+      "slug": "adycha-yurdyuk-kumah",
+      "url": "/gauge/adycha-yurdyuk-kumah",
+      "last_date": "",
+      "lat": 68.01,
+      "lon": 135.28,
+      "water_level_cm": 803,
+      "water_level_delta_cm": 0,
+      "critical_level_cm": null,
+      "adverse_level_cm": null,
+      "dangerous_level_cm": null,
+      "source": "",
+      "error": null
+    },
+    {
+      "river": "aldan",
+      "post": "charan",
+      "slug": "aldan-charan",
+      "url": "/gauge/aldan-charan",
+      "last_date": "",
+      "lat": 60.38,
+      "lon": 134.45,
+      "water_level_cm": 413,
+      "water_level_delta_cm": -9,
+      "critical_level_cm": null,
+      "adverse_level_cm": null,
+      "dangerous_level_cm": null,
+      "source": "",
+      "error": null
+    },
+    {
+      "river": "aldan",
+      "post": "tommot",
+      "slug": "aldan-tommot",
+      "url": "/gauge/aldan-tommot",
+      "last_date": "",
+      "lat": 58.9617,
+      "lon": 126.2834,
+      "water_level_cm": 217,
+      "water_level_delta_cm": -2,
+      "critical_level_cm": null,
+      "adverse_level_cm": null,
+      "dangerous_level_cm": null,
+      "source": "",
+      "error": null
+    },
+    {
+      "river": "aldan",
+      "post": "ust-mil",
+      "slug": "aldan-ust-mil",
+      "url": "/gauge/aldan-ust-mil",
+      "last_date": "",
+      "lat": 59.6382,
+      "lon": 133.1222,
+      "water_level_cm": 414,
+      "water_level_delta_cm": -18,
+      "critical_level_cm": null,
+      "adverse_level_cm": null,
+      "dangerous_level_cm": null,
+      "source": "",
+      "error": null
+    },
+    {
+      "river": "avacha",
+      "post": "elizovo",
+      "slug": "avacha-elizovo",
+      "url": "/gauge/avacha-elizovo",
+      "last_date": "",
+      "lat": 53.1844,
+      "lon": 158.397,
+      "water_level_cm": 377,
+      "water_level_delta_cm": -26,
+      "critical_level_cm": null,
+      "adverse_level_cm": null,
+      "dangerous_level_cm": null,
+      "source": "",
+      "error": null
+    }
+  ]
+}

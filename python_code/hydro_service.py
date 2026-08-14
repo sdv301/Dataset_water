@@ -714,7 +714,8 @@ def build_scenario_forecasts(
         raise ValueError(f"Станция не найдена: {river} / {post}")
     low = float(st.get("low_oya") or 500)
     crit = float(st.get("critical_oya") or 650)
-    base = get_latest_data_date(river, post)
+    latest = get_latest_data_date(river, post)
+    base = max(latest, datetime.date.today())  # прогноз всегда от сегодня
 
     predictor = load_predictor(river, post)
     if predictor:
@@ -1054,7 +1055,11 @@ def tier_forecast(
 
     low = float(st.get("low_oya") or 500)
     crit = float(st.get("critical_oya") or 650)
-    base_date = base_date or get_latest_data_date(river, post)
+    latest = get_latest_data_date(river, post)
+    # Если пользователь явно передал base_date — используем его (для анализа прошлого).
+    # Иначе: прогноз всегда строится от max(последняя запись, сегодня), чтобы
+    # агент прогнозировал будущее, а не повторял последний день из БД.
+    base_date = base_date if base_date is not None else max(latest, datetime.date.today())
 
     default_days = {"short": 7, "medium": 30, "season": 90}.get(tier, 60)
     days = days or default_days

@@ -39,6 +39,9 @@ interface AgentResult {
   has_model: boolean;
   observation_date: string;
   horizon_days: number;
+  data_through?: string | null;
+  data_lag_days?: number | null;
+  stale_warning?: string | null;
   thresholds: { low_oya: number; critical_oya: number };
   forecast_peak: { level_cm: number | null; date: string | null; prob_warning: number | null; prob_danger: number | null };
   forecast_daily: Array<{ date: string; median: number; q10?: number; q90?: number; q95?: number }>;
@@ -192,8 +195,20 @@ export function FloodAgentPanel({ river, post, horizon = 14 }: Props) {
         <div className="text-xs text-slate-400 text-right">
           Оценка от {data.observation_date}
           <div>{data.has_model ? 'ML+правила' : 'только правила'}</div>
+          {data.data_through && (
+            <div className={data.data_lag_days != null && data.data_lag_days > 7 ? 'text-amber-600 font-medium' : ''}>
+              Данные до: {data.data_through}
+              {data.data_lag_days != null && ` (${data.data_lag_days} дн. назад)`}
+            </div>
+          )}
         </div>
       </div>
+      {data.stale_warning && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>{data.stale_warning}</span>
+        </div>
+      )}
       {data.requires_ack && !acked && (
         <div className="rounded-xl border border-red-300 bg-red-50 p-4 flex items-start gap-3">
           <AlertTriangle className="w-5 h-5 text-red-600 mt-0.5" />

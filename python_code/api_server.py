@@ -14,6 +14,8 @@ import sys
 import math
 import json
 import uuid
+import csv
+import io
 import sqlite3
 import logging
 import datetime
@@ -871,6 +873,48 @@ async def get_agent_history(river: str, post: str, days: int = Query(180, ge=7, 
         raise HTTPException(status_code=404, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# Тайловый кэш на диске — ускоряет карту, убирает белый фон при повторных запросах
+# ---------------------------------------------------------------------------
+_TILE_CACHE_DIR = _DATA_DIR / "tile_cache"
+_TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_TILE_CACHE_MAX_AGE_DAYS = 30
+
+
+def _tile_cache_path(provider: str, z: int, x: int, y: int) -> Path:
+    return _TILE_CACHE_DIR / provider / str(z) / str(x) / f"{y}.bin"
+
+
+def _read_cached_tile(provider: str, z: int, x: int, y: int) -> Optional[tuple[bytes, str]]:
+    p = _tile_cache_path(provider, z, x, y)
+    if not p.exists():
+        return None
+    try:
+        age = datetime.datetime.now().timestamp() - p.stat().st_mtime
+        if age > _TILE_CACHE_MAX_AGE_DAYS * 86400:
+            return None
+        meta_p = p.with_suffix(".meta")
+        ct = "image/jpeg"
+        if meta_p.exists():
+            ct = meta_p.read_text(encoding="utf-8").strip() or ct
+        data = p.read_bytes()
+        if len(data) < 100:
+            return None
+        return data, ct
+    except Exception:
+        return None
+
+
+def _write_cached_tile(provider: str, z: int, x: int, y: int, data: bytes, ct: str) -> None:
+    try:
+        p = _tile_cache_path(provider, z, x, y)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        p.with_suffix(".meta").write_text(ct or "image/jpeg", encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Tile cache write failed %s/%s/%s/%s: %s", provider, z, x, y, exc)
+
+
 def _fetch_tile_upstream(url: str) -> tuple[bytes, str]:
     req = urllib.request.Request(url, headers={"User-Agent": "hydropredict/tile-proxy"})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -887,14 +931,23 @@ async def arcgis_tile(z: int, y: int, x: int):
     extent = 2 ** z
     if x < 0 or x >= extent or y < 0 or y >= extent:
         raise HTTPException(status_code=400, detail="Tile out of range")
+    cached = _read_cached_tile("arcgis", z, x, y)
+    if cached:
+        data, ct = cached
+        return Response(content=data, media_type=ct, headers={"Cache-Control": "public, max-age=86400"})
     url = (
         f"https://server.arcgisonline.com/ArcGIS/rest/services/"
         f"World_Imagery/MapServer/tile/{z}/{y}/{x}"
     )
     try:
         data, ct = _fetch_tile_upstream(url)
+        _write_cached_tile("arcgis", z, x, y, data, ct)
         return Response(content=data, media_type=ct, headers={"Cache-Control": "public, max-age=86400"})
     except Exception as exc:
+        # Fallback: serve stale cache if upstream fails
+        stale = _read_cached_tile("arcgis", z, x, y)
+        if stale:
+            return Response(content=stale[0], media_type=stale[1], headers={"Cache-Control": "public, max-age=86400"})
         raise HTTPException(status_code=502, detail=f"ArcGIS tile fetch failed: {exc}") from exc
 
 
@@ -906,11 +959,19 @@ async def carto_tile(z: int, x: int, y: int):
     extent = 2 ** z
     if x < 0 or x >= extent or y < 0 or y >= extent:
         raise HTTPException(status_code=400, detail="Tile out of range")
+    cached = _read_cached_tile("carto", z, x, y)
+    if cached:
+        data, ct = cached
+        return Response(content=data, media_type=ct, headers={"Cache-Control": "public, max-age=86400"})
     url = f"https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png"
     try:
         data, ct = _fetch_tile_upstream(url)
+        _write_cached_tile("carto", z, x, y, data, ct or "image/png")
         return Response(content=data, media_type=ct or "image/png", headers={"Cache-Control": "public, max-age=86400"})
     except Exception as exc:
+        stale = _read_cached_tile("carto", z, x, y)
+        if stale:
+            return Response(content=stale[0], media_type=stale[1], headers={"Cache-Control": "public, max-age=86400"})
         raise HTTPException(status_code=502, detail=f"Carto tile fetch failed: {exc}") from exc
 
 
@@ -1251,6 +1312,137 @@ async def get_history(
         ]
     finally:
         conn.close()
+
+
+# ----------------------------- CSV-шаблоны и импорт --------------------
+
+_TEMPLATES_DIR = _DATA_DIR / "templates"
+
+_OBSERVATIONS_REQUIRED_COLS = {"river", "post", "date"}
+_OBSERVATIONS_OPTIONAL_COLS = {
+    "water_level_cm", "temp_min", "temp_mean", "temp_max",
+    "precip_mm", "snow_pct_norm", "ice_thickness_cm",
+}
+_OBSERVATIONS_NUMERIC_COLS = _OBSERVATIONS_OPTIONAL_COLS
+
+
+@app.get("/api/data/templates/{template_type}")
+async def get_data_template(template_type: str):
+    """Скачать CSV-шаблон для импорта данных (observations или stations)."""
+    mapping = {
+        "observations": "observations_template.csv",
+        "stations": "stations_template.csv",
+    }
+    fname = mapping.get(template_type)
+    if not fname:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Шаблон «{template_type}» не найден. Доступные: {', '.join(mapping.keys())}",
+        )
+    fpath = _TEMPLATES_DIR / fname
+    if not fpath.exists():
+        raise HTTPException(status_code=503, detail=f"Файл шаблона не найден: {fpath.name}")
+    content = fpath.read_bytes()
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+class _ImportResult(BaseModel):
+    rows_total: int
+    rows_inserted: int
+    rows_skipped: int
+    errors: list[str]
+
+
+def _parse_csv_upload(raw: bytes) -> list[dict]:
+    """Парсит байты CSV в список словарей. Поддерживает UTF-8 и UTF-8-BOM."""
+    text = raw.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    return [{k.strip(): (v.strip() if v else None) for k, v in row.items() if k} for row in reader]
+
+
+def _validate_observation_row(row: dict, line_no: int) -> tuple[Optional[dict], Optional[str]]:
+    """Валидирует одну строку наблюдений."""
+    river = (row.get("river") or "").strip()
+    post = (row.get("post") or "").strip()
+    date_raw = (row.get("date") or "").strip()
+    if not river or not post or not date_raw:
+        return None, f"Строка {line_no}: отсутствуют обязательные поля (river/post/date)"
+    try:
+        datetime.date.fromisoformat(date_raw[:10])
+    except ValueError:
+        return None, f"Строка {line_no}: некорректная дата «{date_raw}»"
+    numeric_vals: dict[str, Optional[float]] = {}
+    for col in _OBSERVATIONS_NUMERIC_COLS:
+        val = row.get(col)
+        if val is None or val == "":
+            numeric_vals[col] = None
+        else:
+            try:
+                numeric_vals[col] = float(val)
+            except ValueError:
+                return None, f"Строка {line_no}: колонка «{col}» — не число («{val}»)"
+    return {"river": river, "post": post, "date": date_raw[:10], **numeric_vals}, None
+
+
+@app.post("/api/data/import/observations", response_model=_ImportResult)
+async def import_observations(file: UploadFile = File(...)):
+    """Импорт наблюдений из CSV в таблицу daily_features.
+
+    Обязательные колонки: river, post, date.
+    Опциональные: water_level_cm, temp_min, temp_mean, temp_max, precip_mm, snow_pct_norm, ice_thickness_cm.
+    Дубликаты по (river, post, date) перезаписываются (upsert).
+    """
+    if file.content_type and "csv" not in file.content_type and "text" not in file.content_type:
+        raise HTTPException(status_code=400, detail="Ожидается CSV-файл")
+    raw = await file.read()
+    if len(raw) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Файл слишком большой (макс. 50 МБ)")
+    try:
+        rows = _parse_csv_upload(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Ошибка парсинга CSV: {exc}")
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV пуст или не содержит строк данных")
+    header_cols = set(rows[0].keys())
+    missing = _OBSERVATIONS_REQUIRED_COLS - header_cols
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Отсутствуют обязательные колонки: {', '.join(sorted(missing))}",
+        )
+    conn = _get_db()
+    inserted = 0
+    skipped = 0
+    errors: list[str] = []
+    try:
+        existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_features)").fetchall()}
+        insert_cols = ["river", "post", "date"] + [c for c in _OBSERVATIONS_NUMERIC_COLS if c in existing_cols]
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        col_list = ", ".join(insert_cols)
+        delete_sql = "DELETE FROM daily_features WHERE river = ? AND post = ? AND date = ?"
+        insert_sql = f"INSERT INTO daily_features ({col_list}) VALUES ({placeholders})"
+        for i, raw_row in enumerate(rows, start=2):
+            parsed, err = _validate_observation_row(raw_row, i)
+            if err:
+                errors.append(err)
+                skipped += 1
+                continue
+            values = [parsed.get(c) for c in insert_cols]
+            try:
+                conn.execute(delete_sql, (parsed["river"], parsed["post"], parsed["date"]))
+                conn.execute(insert_sql, values)
+                inserted += 1
+            except sqlite3.Error as e:
+                errors.append(f"Строка {i}: ошибка БД — {e}")
+                skipped += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return _ImportResult(rows_total=len(rows), rows_inserted=inserted, rows_skipped=skipped, errors=errors[:50])
 
 
 # ----------------------------- Обучение -------------------------------
