@@ -36,14 +36,14 @@ const icons = {
 };
 
 const lines = [];
-lines.push("import type { SVGProps } from 'react';");
+lines.push("import type { SVGProps, ElementType } from 'react';");
 lines.push('');
 lines.push('type Node = [string, Record<string, string>];');
 lines.push('');
 lines.push('function renderNodes(nodes: Node[]) {');
 lines.push('  return nodes.map(([tag, attrs], i) => {');
 lines.push('    const { key, ...rest } = attrs;');
-lines.push('    const Tag = tag as keyof JSX.IntrinsicElements;');
+lines.push('    const Tag = tag as ElementType;');
 lines.push('    return <Tag key={key ?? String(i)} {...rest} />;');
 lines.push('  });');
 lines.push('}');

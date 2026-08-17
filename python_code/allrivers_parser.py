@@ -28,10 +28,16 @@ from typing import Dict, List, Optional, Tuple
 
 
 BASE_URL = "https://allrivers.info"
-USER_AGENT = "hydropredict/allrivers-parser (+flood-portal)"
+USER_AGENTS = [
+    "hydropredict/allrivers-parser (+flood-portal)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+]
+USER_AGENT = USER_AGENTS[0]
 REQUEST_TIMEOUT = 30
-RETRY_COUNT = 2
+RETRY_COUNT = 3
 RETRY_DELAY = 2.0
+INTER_REQUEST_DELAY = 8.0  # по умолчанию 8с чтобы не ловить 429 (v2: было 1.5с — неэффективно)
 
 
 @dataclass
@@ -54,14 +60,25 @@ class GaugeInfo:
 
 
 def _fetch_html(url: str, retries: int = RETRY_COUNT) -> str:
-    """Загрузить HTML с повторами при ошибках."""
+    """Загрузить HTML с повторами, ротацией UA и паузой при 429."""
+    import random
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
+        ua = random.choice(USER_AGENTS)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept-Language": "ru,en;q=0.8"})
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                if getattr(resp, "status", 200) == 429:
+                    raise urllib.error.HTTPError(url, 429, "Too Many Requests", resp.headers, None)
                 return resp.read().decode("utf-8", errors="replace")
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if getattr(exc, "code", None) == 429:
+                wait = RETRY_DELAY * (attempt + 1) * 4
+                time.sleep(wait)
+            elif attempt < retries:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+        except (urllib.error.URLError, OSError) as exc:
             last_exc = exc
             if attempt < retries:
                 time.sleep(RETRY_DELAY * (attempt + 1))
@@ -187,42 +204,69 @@ def parse_gauge_page(gauge: GaugeInfo) -> GaugeInfo:
 def collect_allrivers_data(
     region_slug: str = "russia/dvfo-sever",
     limit: Optional[int] = None,
-    workers: int = 3,
+    workers: int = 1,
+    delay: float = INTER_REQUEST_DELAY,
+    resume_file: Optional[str] = None,
+    resume_only: bool = False,
 ) -> Dict:
     """Основной сборщик: парсит регион, затем каждый пост параллельно."""
-    print(f"[AllRivers] Загрузка списка постов региона {region_slug}...")
+    print(f"[AllRivers] Загрузка списка постов региона {region_slug}...", flush=True)
     gauges = parse_region_page(region_slug)
-    print(f"[AllRivers] Найдено {len(gauges)} постов")
+    print(f"[AllRivers] Найдено {len(gauges)} постов", flush=True)
+
+    if resume_only and resume_file:
+        prev_path = Path(resume_file)
+        if not prev_path.exists():
+            raise SystemExit(f"--resume-only: файл не найден: {prev_path}")
+        prev = json.loads(prev_path.read_text(encoding="utf-8"))
+        failed_slugs = {g["slug"] for g in prev.get("gauges", []) if g.get("error")}
+        ok_prev = [g for g in prev.get("gauges", []) if not g.get("error")]
+        gauges = [g for g in gauges if g.slug in failed_slugs]
+        print(f"[AllRivers] resume-only: {len(gauges)} с ошибками, {len(ok_prev)} успешных ранее", flush=True)
+        if not gauges:
+            print("[AllRivers] Все посты уже собраны успешно", flush=True)
+            return {"summary": {"region": region_slug, "total": len(ok_prev), "ok": len(ok_prev), "errors": 0, "with_coords": sum(1 for g in ok_prev if g.get("lat") is not None), "with_water_level": sum(1 for g in ok_prev if g.get("water_level_cm") is not None)}, "gauges": ok_prev}
 
     if limit and limit > 0:
         gauges = gauges[:limit]
-        print(f"[AllRivers] Ограничено до {limit} постов")
+        print(f"[AllRivers] Ограничено до {limit} постов", flush=True)
 
     results: List[GaugeInfo] = []
     total = len(gauges)
 
     def _process(idx_and_gauge: Tuple[int, GaugeInfo]) -> GaugeInfo:
         idx, g = idx_and_gauge
+        eff_delay = delay if delay >= 1 else INTER_REQUEST_DELAY
+        if eff_delay > 0:
+            time.sleep(eff_delay)
         result = parse_gauge_page(g)
         status = "OK" if not result.error else f"ERR: {result.error[:60]}"
         coords = f"({result.lat}, {result.lon})" if result.lat else "(no coords)"
         level = f"{result.water_level_cm} см" if result.water_level_cm is not None else "—"
-        print(f"  [{idx+1}/{total}] {g.slug}: {level} {coords} {status}")
+        print(f"  [{idx+1}/{total}] {g.slug}: {level} {coords} {status}", flush=True)
         return result
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_process, (i, g)): i
-            for i, g in enumerate(gauges)
-        }
-        for future in as_completed(futures):
+    if workers == 1:
+        for i, g in enumerate(gauges):
             try:
-                results.append(future.result())
+                results.append(_process((i, g)))
             except Exception as exc:
-                idx = futures[future]
-                g = gauges[idx]
                 g.error = str(exc)
                 results.append(g)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_process, (i, g)): i
+                for i, g in enumerate(gauges)
+            }
+            for future in as_completed(futures):
+                try:
+                        results.append(future.result())
+                except Exception as exc:
+                    idx = futures[future]
+                    g = gauges[idx]
+                    g.error = str(exc)
+                    results.append(g)
 
     results.sort(key=lambda g: (g.river, g.post))
 
@@ -230,6 +274,24 @@ def collect_allrivers_data(
     err_count = sum(1 for g in results if g.error)
     with_coords = sum(1 for g in results if g.lat is not None)
     with_level = sum(1 for g in results if g.water_level_cm is not None)
+
+    if resume_only and resume_file:
+        prev = json.loads(Path(resume_file).read_text(encoding="utf-8"))
+        prev_ok = [g for g in prev.get("gauges", []) if not g.get("error")]
+        new_by_slug = {asdict(g)["slug"]: asdict(g) for g in results}
+        merged = list(prev_ok) + list(new_by_slug.values())
+        merged.sort(key=lambda g: (g.get("river", ""), g.get("post", "")))
+        return {
+            "summary": {
+                "region": region_slug,
+                "total": len(merged),
+                "ok": sum(1 for g in merged if not g.get("error")),
+                "errors": sum(1 for g in merged if g.get("error")),
+                "with_coords": sum(1 for g in merged if g.get("lat") is not None),
+                "with_water_level": sum(1 for g in merged if g.get("water_level_cm") is not None),
+            },
+            "gauges": merged,
+        }
 
     return {
         "summary": {
@@ -248,7 +310,10 @@ def main():
     parser = argparse.ArgumentParser(description="Парсер allrivers.info для гидропостов")
     parser.add_argument("--region", default="russia/dvfo-sever", help="Slug региона")
     parser.add_argument("--limit", type=int, default=None, help="Максимум постов")
-    parser.add_argument("--workers", type=int, default=3, help="Параллельных запросов")
+    parser.add_argument("--workers", type=int, default=1, help="Параллельных запросов (рекомендуется 1 против 429)")
+    parser.add_argument("--resume-only", action="store_true", help="Докачать только посты с ошибками из --resume-file")
+    parser.add_argument("--resume-file", default=None, help="Предыдущий JSON для resume-only")
+    parser.add_argument("--delay", type=float, default=INTER_REQUEST_DELAY, help="Пауза между запросами (сек)")
     parser.add_argument("--output", default=None, help="Выходной файл JSON")
     args = parser.parse_args()
 
@@ -257,6 +322,9 @@ def main():
         region_slug=args.region,
         limit=args.limit,
         workers=args.workers,
+        delay=args.delay,
+        resume_file=args.resume_file,
+        resume_only=args.resume_only,
     )
     elapsed = time.time() - start
 
@@ -265,7 +333,7 @@ def main():
     out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     s = data["summary"]
-    print(f"\n[AllRivers] Готово за {elapsed:.1f}с")
+    print(f"\n[AllRivers] Готово за {elapsed:.1f}с", flush=True)
     print(f"  Всего: {s['total']}, OK: {s['ok']}, Ошибок: {s['errors']}")
     print(f"  С координатами: {s['with_coords']}, С уровнем: {s['with_water_level']}")
     print(f"  Файл: {out.resolve()}")

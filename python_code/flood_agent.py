@@ -552,8 +552,8 @@ def assess_flood_risk(
     peak_q90, peak_q90_date = _peak_by("q90")
     peak_q10, peak_q10_date = _peak_by("q10")
 
-    # --- Вердикт «будет паводок» с СТРОГИМИ порогами ---
-    # will_flood = P(q90 ≥ НЯ по горизонту) ≥ 0.7 И ≥2 драйверов ИЛИ p_danger ≥ 0.85
+    # --- Вердикт «будет паводок» — СТРОГИЙ порог ---
+    # will_flood = P(q90 ≥ НЯ по горизонту) ≥ 0.7  (строго, без доп. условий по драйверам/prob)
     days_q90_over_low = sum(
         1 for p in forecast_points
         if (p.get("q90") is not None and p.get("q90") >= low)
@@ -566,9 +566,11 @@ def assess_flood_risk(
     p_exceed_low = days_q90_over_low / horizon_len
     p_exceed_crit = days_q90_over_crit / horizon_len
 
-    verdict_yellow = (p_exceed_low >= 0.7 and len(drivers) >= 2) or (prob_warn or 0) >= 0.7
-    verdict_red = (p_exceed_crit >= 0.85) or ((prob_dang or 0) >= 0.85 and len(drivers) >= 2)
-    will_flood = verdict_red or verdict_yellow
+    # Строгое правило для will_flood (ТЗ): только доля дней где q90 ≥ НЯ
+    will_flood = p_exceed_low >= 0.7
+    # Уровень для UI: red если и ОЯ выполнен на ≥0.7, yellow если только НЯ, иначе green
+    verdict_red = p_exceed_crit >= 0.7
+    verdict_yellow = will_flood and not verdict_red
     verdict_level = "red" if verdict_red else ("yellow" if verdict_yellow else "green")
     verdict_confidence = round(max(0.0, min(1.0, max(
         p_exceed_crit,

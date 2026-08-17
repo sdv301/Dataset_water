@@ -1,11 +1,12 @@
-import React, { type SVGProps } from 'react';
+import type { SVGProps, ElementType } from 'react';
 
 type Node = [string, Record<string, string>];
 
 function renderNodes(nodes: Node[]) {
   return nodes.map(([tag, attrs], i) => {
     const { key, ...rest } = attrs;
-    return React.createElement(tag, { key: key ?? String(i), ...rest });
+    const Tag = tag as ElementType;
+    return <Tag key={key ?? String(i)} {...rest} />;
   });
 }
 

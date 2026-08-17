@@ -1445,6 +1445,113 @@ async def import_observations(file: UploadFile = File(...)):
     return _ImportResult(rows_total=len(rows), rows_inserted=inserted, rows_skipped=skipped, errors=errors[:50])
 
 
+# ----------------------------- Импорт станций --------------------------
+
+_STATIONS_REQUIRED_COLS = {"river", "post"}
+_STATIONS_OPTIONAL_COLS = {
+    "lat", "lon", "low_oya", "critical_oya", "district", "oktmo",
+}
+_STATIONS_NUMERIC_COLS = {"lat", "lon", "low_oya", "critical_oya", "oktmo"}
+
+
+def _validate_station_row(row: dict, line_no: int) -> tuple[Optional[dict], Optional[str]]:
+    """Валидирует одну строку станции."""
+    river = (row.get("river") or "").strip()
+    post = (row.get("post") or "").strip()
+    if not river or not post:
+        return None, f"Строка {line_no}: отсутствуют обязательные поля (river/post)"
+    parsed: dict = {"river": river, "post": post}
+    # name_ru (необязательное текстовое поле)
+    if row.get("name_ru"):
+        parsed["name_ru"] = row["name_ru"].strip()
+    for col in _STATIONS_NUMERIC_COLS:
+        val = row.get(col)
+        if val is None or val == "":
+            parsed[col] = None
+        else:
+            try:
+                parsed[col] = float(val)
+            except ValueError:
+                return None, f"Строка {line_no}: колонка «{col}» — не число («{val}»)"
+    for col in ("district",):
+        parsed[col] = (row.get(col) or "").strip() or None
+    return parsed, None
+
+
+@app.post("/api/data/import/stations", response_model=_ImportResult)
+async def import_stations(file: UploadFile = File(...)):
+    """Импорт станций из CSV в таблицу stations.
+
+    Обязательные колонки: river, post.
+    Опциональные: lat, lon, low_oya, critical_oya, district, oktmo, name_ru.
+    Дубликаты по (river, post) перезаписываются (upsert).
+    """
+    if file.content_type and "csv" not in file.content_type and "text" not in file.content_type:
+        raise HTTPException(status_code=400, detail="Ожидается CSV-файл")
+    raw = await file.read()
+    if len(raw) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Файл слишком большой (макс. 50 МБ)")
+    try:
+        rows = _parse_csv_upload(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Ошибка парсинга CSV: {exc}")
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV пуст или не содержит строк данных")
+    header_cols = set(rows[0].keys())
+    missing = _STATIONS_REQUIRED_COLS - header_cols
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Отсутствуют обязательные колонки: {', '.join(sorted(missing))}",
+        )
+    conn = _get_db()
+    inserted = 0
+    skipped = 0
+    errors: list[str] = []
+    try:
+        existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(stations)").fetchall()}
+        update_cols = ["lat", "lon", "low_oya", "critical_oya", "district", "oktmo"]
+        for i, raw_row in enumerate(rows, start=2):
+            parsed, err = _validate_station_row(raw_row, i)
+            if err:
+                errors.append(err)
+                skipped += 1
+                continue
+            river, post = parsed["river"], parsed["post"]
+            try:
+                existing = conn.execute(
+                    "SELECT river FROM stations WHERE river = ? AND post = ?", (river, post)
+                ).fetchone()
+                if existing:
+                    # Обновляем только переданные поля
+                    sets = []
+                    vals = []
+                    for col in update_cols:
+                        if col in existing_cols and parsed.get(col) is not None:
+                            sets.append(f"{col} = ?")
+                            vals.append(parsed[col])
+                    if sets:
+                        conn.execute(
+                            f"UPDATE stations SET {', '.join(sets)} WHERE river = ? AND post = ?",
+                            vals + [river, post],
+                        )
+                else:
+                    cols = ["river", "post"] + [c for c in update_cols if c in existing_cols]
+                    vals = [river, post] + [parsed.get(c) for c in update_cols if c in existing_cols]
+                    placeholders = ", ".join(["?"] * len(cols))
+                    conn.execute(
+                        f"INSERT INTO stations ({', '.join(cols)}) VALUES ({placeholders})", vals
+                    )
+                inserted += 1
+            except sqlite3.Error as e:
+                errors.append(f"Строка {i}: ошибка БД — {e}")
+                skipped += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return _ImportResult(rows_total=len(rows), rows_inserted=inserted, rows_skipped=skipped, errors=errors[:50])
+
+
 # ----------------------------- Обучение -------------------------------
 
 @app.post("/api/train", response_model=TrainStarted)

@@ -8,7 +8,8 @@ import {
   Thermometer, CloudRain, Snowflake, AlertOctagon, TrendingUp, AlertTriangle, Plus, X, BarChart2,
   Database, Upload, RefreshCw, FileText, Loader2, Crosshair,
 } from './components/icons';
-import { Map as PigeonMap, Overlay } from 'pigeon-maps';
+import MapGL, { Marker, type ViewStateChangeEvent } from 'react-map-gl/maplibre';
+import 'maplibre-gl/dist/maplibre-gl.css';
 import { format, addDays, subDays } from 'date-fns';
 import { ru } from 'date-fns/locale';
 import {
@@ -93,6 +94,9 @@ const AVAILABLE_WIDGETS: { id: WidgetId, label: string, width: 'full' | 'half' }
   { id: 'risk_pie', label: 'Распределение риска', width: 'half' },
 ];
 
+// Демо-данные: используются ТОЛЬКО когда API не вернул ни истории, ни прогноза
+// (has_model == false или API недоступен). В остальных случаях игнорируется.
+// На карточках стоит бейдж «Демо / нет модели» (isMock), а ExplainPanel показывает «демо».
 const generateMockData = (days: number, baseLevel: number, tempMod: number, precipMod: number) => {
   return Array.from({ length: days }).map((_, i) => {
     const date = addDays(new Date(), i);
@@ -139,6 +143,55 @@ const DEFAULT_STATIONS: StationInfo[] = [
   { label: 'Амга — Амга', river: 'Амга', post: 'Амга', lat: 60.90, lng: 131.98, risk: 'low', critical_oya: 925 },
 ];
 
+// --- MapLibre raster style builder (Task 7) ---
+function buildRasterStyle(
+  name: string,
+  sourceId: string,
+  tilesUrl: string,
+  attribution: string,
+  maxzoom = 19,
+) {
+  return {
+    version: 8 as const,
+    name,
+    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+    sources: {
+      [sourceId]: {
+        type: 'raster' as const,
+        tiles: [tilesUrl],
+        tileSize: 256,
+        maxzoom,
+        attribution,
+      },
+    },
+    layers: [
+      {
+        id: `${sourceId}-layer`,
+        type: 'raster' as const,
+        source: sourceId,
+        minzoom: 0,
+        maxzoom: 22,
+      },
+    ],
+  };
+}
+
+const SATELLITE_STYLE = buildRasterStyle(
+  'Satellite',
+  'satellite-tiles',
+  MAP_SATELLITE_TILES_URL.replace('{z}', '{z}').replace('{y}', '{y}').replace('{x}', '{x}'),
+  '© Esri, Maxar, Earthstar Geographics',
+  18,
+);
+
+const SCHEME_STYLE = buildRasterStyle(
+  'Scheme',
+  'scheme-tiles',
+  MAP_SCHEME_TILES_URL.replace('{z}', '{z}').replace('{x}', '{x}').replace('{y}', '{y}'),
+  '© CARTO, © OpenStreetMap contributors',
+  19,
+);
+
 export default function App() {
   const [mode, setMode] = useState<ForecastMode>('short');
   const [activeWidgets, setActiveWidgets] = useState<WidgetId[]>(['peak_analysis', 'cross_model', 'scatter', 'basin_risk']);
@@ -163,6 +216,8 @@ export default function App() {
     snow_depth_cm?: number | null;
   }>>([]);
   const [datasetLoading, setDatasetLoading] = useState(false);
+  const [importMsg, setImportMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [importing, setImporting] = useState<'observations' | 'stations' | null>(null);
   const [trainingStatus, setTrainingStatus] = useState<TrainingStatus>({ status: 'idle', progress: 0, current_station: '', message: '' });
   const [trainingHistory, setTrainingHistory] = useState<TrainingHistoryRow[]>([]);
   const trainPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -351,6 +406,52 @@ export default function App() {
       .finally(() => setDatasetLoading(false));
   }, [currentStation?.river, currentStation?.post]);
 
+  const downloadTemplate = useCallback(async (kind: 'observations' | 'stations') => {
+    try {
+      const r = await fetch(`${API_BASE}/data/templates/${kind}`);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(typeof err.detail === 'string' ? err.detail : r.statusText);
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${kind}_template.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setImportMsg({ kind: 'err', text: `Не удалось скачать шаблон: ${e.message || e}` });
+    }
+  }, []);
+
+  const importCsv = useCallback(async (kind: 'observations' | 'stations', file: File) => {
+    setImporting(kind);
+    setImportMsg(null);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const r = await fetch(`${API_BASE}/data/import/${kind}`, { method: 'POST', body: formData });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${r.status}`);
+      }
+      const parts = [`Импортировано: ${body.rows_inserted} из ${body.rows_total}`];
+      if (body.rows_skipped) parts.push(`пропущено: ${body.rows_skipped}`);
+      if (body.errors?.length) parts.push(`ошибки: ${body.errors.slice(0, 3).join('; ')}`);
+      setImportMsg({ kind: 'ok', text: `${kind === 'observations' ? 'Наблюдения' : 'Станции'} — ${parts.join(', ')}` });
+      fetchDataStats();
+      fetchDatasetPreview();
+      loadStationsFromApi(station);
+    } catch (e: any) {
+      setImportMsg({ kind: 'err', text: `Ошибка импорта: ${e.message || e}` });
+    } finally {
+      setImporting(null);
+    }
+  }, [fetchDataStats, fetchDatasetPreview, loadStationsFromApi, station]);
+
   useEffect(() => {
     if (mode !== 'data') return;
     fetchTrainingHistory();
@@ -516,6 +617,18 @@ export default function App() {
           setApiConnected(true);
         })
         .catch(() => setClimatology([]));
+    }
+
+    // Дашборды: подгружаем explain (горизонт 30) и историю для scatter/heatmap
+    if (mode === 'dashboards' && currentStation) {
+      fetch(`${API_BASE}/explain/${encR}/${encP}?horizon=30`)
+        .then(r => r.ok ? r.json() : null)
+        .then(setExplain)
+        .catch(() => setExplain(null));
+      fetch(`${API_BASE}/history/${encR}/${encP}?days=90`)
+        .then(r => r.ok ? r.json() : [])
+        .then(data => { if (Array.isArray(data)) setApiHistory(data); })
+        .catch(() => setApiHistory([]));
     }
 
     if (mode === 'short' || mode === 'medium') {
@@ -1109,21 +1222,36 @@ export default function App() {
                             const label = formatDateRu(p.date, 'dd MMM');
                             if (!byDate[label]) byDate[label] = { date: label };
                             byDate[label][sc.id] = Math.round(p.median);
+                            if (sc.id === 'sliders') {
+                              byDate[label]['sliders_q10'] = Math.round(p.q10 ?? p.median * 0.9);
+                              byDate[label]['sliders_q95'] = Math.round(p.q95 ?? p.median * 1.15);
+                            }
                           });
                         });
                         return Object.values(byDate).slice(0, 30);
                       })();
+                      // p_exceed для сценария «ползунки»: P(q90 >= НЯ) без повторного запроса модели
+                      const slidersSc = scenarios.find((s: any) => s.id === 'sliders');
+                      const slidersPts = slidersSc?.points || [];
+                      const pExceed = slidersPts.length > 0
+                        ? slidersPts.filter((p: any) => (p.q90 ?? p.median) >= warningLevel).length / slidersPts.length
+                        : null;
+                      const willFloodVerdict = pExceed !== null
+                        ? (pExceed >= 0.7 ? 'Вероятен паводок' : pExceed >= 0.3 ? 'Умеренный риск' : 'Низкий риск')
+                        : null;
                       return (
                       <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
-                        <h3 className="text-base font-semibold text-slate-800 mb-2">Сравнение сценариев «что если»</h3>
+                        <h3 className="text-base font-semibold text-slate-800 mb-2">Сценарийная комната «что если»</h3>
                         <p className="text-xs text-slate-500 mb-2">
                           От базового прогноза модели (CatBoost). Ползунки слева меняют сценарий «Ваш сценарий».
+                          Пунктирные линии — оптимистичная (q10) и пессимистичная (q95) границы вашего сценария.
                           {scenarioPayload?.base_date && <> База: {formatDateRu(scenarioPayload.base_date)}.</>}
                         </p>
                         <QuantileLegend compact />
                         {!crossData.length ? (
                           <p className="text-sm text-slate-500 py-8 text-center">Загрузка сценариев… Откройте «Средний» или «Краткий» прогноз при необходимости.</p>
                         ) : (
+                        <>
                         <div className="h-[350px] w-full mt-3">
                           <ResponsiveContainer width="100%" height="100%">
                             <ComposedChart data={crossData} margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
@@ -1132,6 +1260,8 @@ export default function App() {
                               <YAxis stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={['dataMin - 50', 'dataMax + 50']} />
                               <RechartsTooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
                               <Legend wrapperStyle={{ paddingTop: '12px' }} />
+                              <ReferenceLine y={warningLevel} stroke="#f97316" strokeDasharray="4 4" label={{ value: `НЯ ${warningLevel}`, fill: '#f97316', fontSize: 11 }} />
+                              <ReferenceLine y={dangerLevel} stroke="#ef4444" strokeDasharray="4 4" label={{ value: `ОЯ ${dangerLevel}`, fill: '#ef4444', fontSize: 11 }} />
                               {scenarios.map((sc: any) => (
                                 <Line
                                   key={sc.id}
@@ -1144,35 +1274,67 @@ export default function App() {
                                   dot={false}
                                 />
                               ))}
+                              <Line type="monotone" dataKey="sliders_q10" name="Оптимистичный (q10)" stroke="#93c5fd" strokeWidth={1.5} strokeDasharray="2 2" dot={false} />
+                              <Line type="monotone" dataKey="sliders_q95" name="Пессимистичный (q95)" stroke="#ef4444" strokeWidth={1.5} strokeDasharray="2 2" dot={false} />
                             </ComposedChart>
                           </ResponsiveContainer>
                         </div>
+                        {pExceed !== null && (
+                          <div className="mt-4 p-4 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-between">
+                            <div>
+                              <div className="text-xs text-slate-500 uppercase font-semibold">Вероятность превышения НЯ ({warningLevel} см)</div>
+                              <div className="text-lg font-bold text-slate-800 mt-1">
+                                P(q90 ≥ НЯ) = {(pExceed * 100).toFixed(0)}%
+                                <span className="ml-3 text-sm font-medium text-slate-500">
+                                  ({slidersPts.filter((p: any) => (p.q90 ?? p.median) >= warningLevel).length} из {slidersPts.length} дней)
+                                </span>
+                              </div>
+                            </div>
+                            <div className={`px-4 py-2 rounded-lg font-bold text-white ${
+                              pExceed >= 0.7 ? 'bg-red-500' : pExceed >= 0.3 ? 'bg-orange-500' : 'bg-emerald-500'
+                            }`}>
+                              {willFloodVerdict}
+                            </div>
+                          </div>
+                        )}
+                        </>
                         )}
                       </div>
                     );}
 
                     if (wId === 'scatter') {
-                      const scatterData = forecastMapped.slice(0, 30).map((d, i) => ({
-                         temp: (tempMod + 15 * Math.sin(i / 5)).toFixed(1),
-                         level: Math.round(d.median),
-                      }));
+                      // Реальная корреляция: температура vs уровень из истории наблюдений
+                      const scatterData = apiHistory
+                        .filter((d: any) => d.temp_mean != null && d.water_level_cm != null)
+                        .slice(-90)
+                        .map((d: any) => ({
+                          temp: Number(d.temp_mean),
+                          level: Number(d.water_level_cm),
+                        }));
+                      const hasScatterData = scatterData.length >= 5;
                       return (
                       <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
                         <h3 className="text-base font-semibold text-slate-800 mb-6 flex items-center justify-between">
-                          <span>Корреляция: Прогнозные температуры и уровни (ближайшие 30 дней)</span>
+                          <span>Корреляция: Температура и уровень воды (последние 90 дней)</span>
                           <BarChart2 className="w-5 h-5 text-slate-400" />
                         </h3>
+                        {!hasScatterData ? (
+                          <div className="h-[300px] w-full flex items-center justify-center text-sm text-slate-500 bg-slate-50 rounded-xl border border-dashed border-slate-300">
+                            Недостаточно данных с температурой для построения диаграммы рассеяния
+                          </div>
+                        ) : (
                         <div className="h-[300px] w-full">
                           <ResponsiveContainer width="100%" height="100%">
                             <ComposedChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
                               <CartesianGrid stroke="#f1f5f9" strokeDasharray="3 3" />
-                              <XAxis type="number" dataKey="temp" name="Температура (°C)" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={[-10, 30]} />
+                              <XAxis type="number" dataKey="temp" name="Температура (°C)" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={['dataMin - 2', 'dataMax + 2']} />
                               <YAxis type="number" dataKey="level" name="Уровень воды (см)" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} domain={['dataMin - 50', 'dataMax + 50']} />
                               <RechartsTooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
-                              <Scatter name="Прогноз" data={scatterData} fill="#3b82f6" opacity={0.8} />
+                              <Scatter name="Наблюдения" data={scatterData} fill="#3b82f6" opacity={0.8} />
                             </ComposedChart>
                           </ResponsiveContainer>
                         </div>
+                        )}
                       </div>
                     );}
 
@@ -1203,48 +1365,85 @@ export default function App() {
                       </div>
                     );
 
-                    if (wId === 'feature_importance') return (
+                    if (wId === 'feature_importance') {
+                      // Реальная важность признаков из /api/explain
+                      const fiRaw = explain?.feature_importance || {};
+                      const fiData = Object.entries(fiRaw)
+                        .map(([name, imp]) => ({ name, imp: Number(imp) }))
+                        .sort((a, b) => b.imp - a.imp)
+                        .slice(0, 7);
+                      const hasFi = fiData.length > 0;
+                      return (
                       <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
                         <h3 className="text-base font-semibold text-slate-800 mb-6 flex items-center justify-between">
                           <span>Влияние предикторов модели (Feature Importance)</span>
                           <Settings2 className="w-5 h-5 text-slate-400" />
                         </h3>
+                        {!hasFi ? (
+                          <div className="h-[300px] w-full flex items-center justify-center text-sm text-slate-500 bg-slate-50 rounded-xl border border-dashed border-slate-300">
+                            Нет данных о важности признаков. Запустите прогноз или обучение модели.
+                          </div>
+                        ) : (
                         <div className="h-[300px] w-full">
                           <ResponsiveContainer width="100%" height="100%">
-                            <BarChart layout="vertical" data={[
-                                { name: 'Уровень t-1', imp: 0.85 },
-                                { name: 'Сумма осадков 3д', imp: 0.65 },
-                                { name: 'Снежный покров', imp: 0.45 },
-                                { name: 'Т-ср 7д', imp: 0.35 },
-                                { name: 'Осадки t-1', imp: 0.25 },
-                              ]} margin={{ top: 5, right: 30, left: 40, bottom: 5 }}
-                            >
+                            <BarChart layout="vertical" data={fiData} margin={{ top: 5, right: 30, left: 40, bottom: 5 }}>
                               <CartesianGrid strokeDasharray="3 3" horizontal={true} vertical={false} stroke="#e2e8f0" />
-                              <XAxis type="number" domain={[0, 1]} stroke="#64748b" fontSize={12} tickLine={false} axisLine={false} />
-                              <YAxis dataKey="name" type="category" stroke="#475569" fontSize={12} tickLine={false} axisLine={false} fontWeight={500} />
+                              <XAxis type="number" domain={[0, 'auto']} stroke="#64748b" fontSize={12} tickLine={false} axisLine={false} />
+                              <YAxis dataKey="name" type="category" stroke="#475569" fontSize={12} tickLine={false} axisLine={false} fontWeight={500} width={120} />
                               <RechartsTooltip cursor={{fill: 'transparent'}} contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
                               <Bar dataKey="imp" fill="#3b82f6" radius={[0, 4, 4, 0]} barSize={20} />
                             </BarChart>
                           </ResponsiveContainer>
                         </div>
+                        )}
                       </div>
-                    );
+                    );}
 
                     if (wId === 'heatmap') {
-                      const metrics = ['Уров', 'Осад', 'Снег', 'Т°С', 'Влаж'];
-                      const corrMatrix = [
-                        [ 1.0,   0.6,   0.4,   0.3,   0.2 ],
-                        [ 0.6,   1.0,   0.1,  -0.2,   0.4 ],
-                        [ 0.4,   0.1,   1.0,  -0.8,   0.1 ],
-                        [ 0.3,  -0.2,  -0.8,   1.0,  -0.3 ],
-                        [ 0.2,   0.4,   0.1,  -0.3,   1.0 ],
+                      // Реальная матрица корреляций из истории наблюдений
+                      const hmKeys = [
+                        { key: 'water_level_cm', label: 'Уров' },
+                        { key: 'precip_mm', label: 'Осад' },
+                        { key: 'temp_mean', label: 'Т°С' },
                       ];
+                      const hmRows = apiHistory.filter((d: any) =>
+                        d.water_level_cm != null && d.temp_mean != null && d.precip_mm != null
+                      ).slice(-120);
+                      const computeCorr = (a: number[], b: number[]) => {
+                        const n = a.length;
+                        if (n < 3) return 0;
+                        const ma = a.reduce((s, v) => s + v, 0) / n;
+                        const mb = b.reduce((s, v) => s + v, 0) / n;
+                        let num = 0, da = 0, db = 0;
+                        for (let i = 0; i < n; i++) {
+                          const x = a[i] - ma, y = b[i] - mb;
+                          num += x * y; da += x * x; db += y * y;
+                        }
+                        const denom = Math.sqrt(da * db);
+                        return denom > 0 ? num / denom : 0;
+                      };
+                      const corrMatrix = hmKeys.map((_, i) =>
+                        hmKeys.map((_, j) => {
+                          if (i === j) return 1.0;
+                          const ai = hmRows.map((d: any) => Number(d[hmKeys[i].key]));
+                          const aj = hmRows.map((d: any) => Number(d[hmKeys[j].key]));
+                          return Math.round(computeCorr(ai, aj) * 100) / 100;
+                        })
+                      );
+                      const metrics = hmKeys.map(k => k.label);
+                      const hasHmData = hmRows.length >= 10;
                       return (
                         <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
                           <h3 className="text-base font-semibold text-slate-800 mb-6 flex items-center justify-between">
                             <span>Матрица корреляций Пирсона</span>
                             <Map className="w-5 h-5 text-slate-400" />
                           </h3>
+                          {!hasHmData ? (
+                            <div className="h-[300px] w-full flex items-center justify-center text-sm text-slate-500 bg-slate-50 rounded-xl border border-dashed border-slate-300">
+                              Недостаточно данных для расчёта корреляций (нужно минимум 10 дней с полными наблюдениями)
+                            </div>
+                          ) : (
+                          <>
                           <div className="w-full aspect-square max-h-[300px] mx-auto flex flex-col">
                             <div className="flex">
                               <div className="w-12 h-6"></div>
@@ -1254,17 +1453,14 @@ export default function App() {
                               <div key={i} className="flex flex-1 mt-1">
                                 <div className="w-12 flex items-center justify-end pr-2 text-[10px] sm:text-xs font-medium text-slate-500">{metrics[i]}</div>
                                 {row.map((val, j) => {
-                                  // Map correlation -1..1 to color
                                   const isPos = val > 0;
                                   const absVal = Math.abs(val);
-                                  // Positive correlation -> Blues, Negative -> Reds
                                   const r = isPos ? Math.round(255 - (255 - 59)*absVal) : Math.round(255 - (255 - 239)*absVal);
                                   const g = isPos ? Math.round(255 - (255 - 130)*absVal) : Math.round(255 - (255 - 68)*absVal);
                                   const b = isPos ? Math.round(255 - (255 - 246)*absVal) : Math.round(255 - (255 - 68)*absVal);
-
                                   return (
-                                    <div 
-                                      key={j} 
+                                    <div
+                                      key={j}
                                       className="flex-1 m-px rounded flex items-center justify-center text-xs font-medium group relative cursor-pointer hover:ring-2 hover:ring-slate-300 transition-all border border-slate-100"
                                       style={{ backgroundColor: `rgb(${r},${g},${b})`, color: absVal > 0.5 ? 'white' : '#334155' }}
                                     >
@@ -1283,31 +1479,49 @@ export default function App() {
                             <div className="h-2 flex-1 mx-2 rounded bg-gradient-to-r from-red-500 via-white to-blue-500 border border-slate-200"></div>
                             <span>Прямая (1)</span>
                           </div>
+                          </>
+                          )}
                         </div>
                       );
                     }
 
-                    if (wId === 'risk_pie') return (
+                    if (wId === 'risk_pie') {
+                      // Реальное распределение риска по всем загруженным станциям
+                      const riskCounts = stations.reduce((acc, s) => {
+                        const r = s.risk || 'low';
+                        if (r === 'critical' || r === 'high') acc.danger += 1;
+                        else if (r === 'medium') acc.warning += 1;
+                        else acc.normal += 1;
+                        return acc;
+                      }, { danger: 0, warning: 0, normal: 0 });
+                      const pieData = [
+                        { name: 'Опасный', value: riskCounts.danger, color: '#ef4444' },
+                        { name: 'Повышенный', value: riskCounts.warning, color: '#f97316' },
+                        { name: 'В норме', value: riskCounts.normal, color: '#10b981' },
+                      ].filter(d => d.value > 0);
+                      const totalStations = stations.length;
+                      return (
                       <div key={wId} className={`bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ${colClass}`}>
                         <h3 className="text-base font-semibold text-slate-800 mb-6 flex items-center justify-between">
-                          <span>Долевое распределение по уровням риска</span>
+                          <span>Долевое распределение по уровням риска ({totalStations} постов)</span>
                           <AlertOctagon className="w-5 h-5 text-slate-400" />
                         </h3>
+                        {pieData.length === 0 ? (
+                          <div className="h-[300px] w-full flex items-center justify-center text-sm text-slate-500 bg-slate-50 rounded-xl border border-dashed border-slate-300">
+                            Нет данных о станциях для расчёта распределения
+                          </div>
+                        ) : (
                         <div className="h-[300px] w-full">
                           <ResponsiveContainer width="100%" height="100%">
                             <PieChart>
                               <Pie
-                                data={[
-                                  { name: 'Опасный', value: 2, color: '#ef4444' },
-                                  { name: 'Повышенный', value: 8, color: '#f97316' },
-                                  { name: 'В норме', value: 35, color: '#10b981' },
-                                ]}
+                                data={pieData}
                                 cx="50%" cy="50%" innerRadius={80} outerRadius={110} paddingAngle={5}
                                 dataKey="value" stroke="none"
                                 label={({name, percent}) => `${name} ${(percent * 100).toFixed(0)}%`}
                                 labelLine={false}
                               >
-                                {[{color:'#ef4444'},{color:'#f97316'},{color:'#10b981'}].map((entry, index) => (
+                                {pieData.map((entry, index) => (
                                   <Cell key={`cell-${index}`} fill={entry.color} />
                                 ))}
                               </Pie>
@@ -1315,8 +1529,9 @@ export default function App() {
                             </PieChart>
                           </ResponsiveContainer>
                         </div>
+                        )}
                       </div>
-                    );
+                    );}
 
                     return null;
                   })}
@@ -1367,26 +1582,17 @@ export default function App() {
                   </div>
                 </div>
                 <div className="h-[400px] w-full rounded-xl overflow-hidden border border-slate-200 z-0 relative bg-slate-900">
-                  <PigeonMap 
-                    center={mapCenter}
+                  <MapGL
+                    longitude={mapCenter[1]}
+                    latitude={mapCenter[0]}
                     zoom={mapZoom}
-                    animate
-                    onBoundsChanged={({ center, zoom }) => {
-                      setMapCenter(center);
+                    mapStyle={mapStyle === 'satellite' ? SATELLITE_STYLE : SCHEME_STYLE}
+                    onMove={(e: ViewStateChangeEvent) => {
+                      const { latitude, longitude, zoom } = e.viewState;
+                      setMapCenter([latitude, longitude]);
                       setMapZoom(zoom);
                     }}
-                    provider={(x, y, z) => {
-                      if (mapStyle === 'satellite') {
-                        return MAP_SATELLITE_TILES_URL
-                          .replace('{z}', String(z))
-                          .replace('{y}', String(y))
-                          .replace('{x}', String(x));
-                      }
-                      return MAP_SCHEME_TILES_URL
-                        .replace('{z}', String(z))
-                        .replace('{x}', String(x))
-                        .replace('{y}', String(y));
-                    }}
+                    attributionControl={false}
                   >
                     {stations.map(s => {
                       let fillColor = '';
@@ -1413,8 +1619,7 @@ export default function App() {
                       const isSelected = s.label === station;
 
                       return (
-                        // @ts-expect-error pigeon-maps Overlay props типизация не включает React key
-                        <Overlay key={s.label} anchor={[s.lat, s.lng]} offset={[isSelected ? 12 : 8, isSelected ? 12 : 8]}>
+                        <Marker key={s.label} longitude={s.lng} latitude={s.lat} anchor="center">
                           <div className="relative group cursor-pointer" onClick={() => setStation(s.label)}>
                             <div 
                               className={`rounded-full shadow-md transition-all ${isSelected ? 'w-6 h-6 relative z-10' : 'w-4 h-4'}`}
@@ -1429,10 +1634,10 @@ export default function App() {
                               <div className="text-xs text-slate-600 mt-1">{labelObj} <strong>{dataValue}</strong></div>
                             </div>
                           </div>
-                        </Overlay>
+                        </Marker>
                       );
                     })}
-                  </PigeonMap>
+                  </MapGL>
                   <div className="absolute bottom-2 left-2 right-2 text-[10px] text-white/90 bg-black/40 px-2 py-1 rounded pointer-events-none">
                     {mapStyle === 'satellite'
                       ? '© Esri, Maxar, Earthstar Geographics'
@@ -1473,33 +1678,66 @@ export default function App() {
                   <div className="lg:col-span-2 bg-white rounded-2xl p-6 border border-slate-200 shadow-sm">
                     <h3 className="text-base font-semibold text-slate-800 mb-4 flex items-center gap-2">
                       <Database className="w-5 h-5 text-blue-500" />
-                      Источники данных (Файлы телеметрии)
+                      Импорт данных (CSV)
                     </h3>
-                    <div className="border-2 border-dashed border-slate-200 bg-slate-50 hover:bg-slate-100 transition-colors rounded-xl p-8 flex flex-col items-center justify-center cursor-pointer text-center group">
-                      <Upload className="w-10 h-10 text-slate-400 group-hover:text-blue-500 mb-4 transition-colors" />
-                      <p className="text-sm font-medium text-slate-700">Перетащите CSV / Excel датасеты сюда</p>
-                      <p className="text-xs text-slate-500 mt-2">Требуются: date, temp_mean_c, precip_mm, snow_depth_cm и water_level_cm</p>
-                      <label className="mt-6 bg-blue-600 text-white text-sm font-medium px-5 py-2 rounded-lg hover:bg-blue-700 transition-colors font-sans cursor-pointer inline-block">
-                        Выбрать файл
-                        <input type="file" className="hidden" accept=".csv,.xlsx" onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (!file) return;
-                          const formData = new FormData();
-                          formData.append('file', file);
-                          fetch(`${API_BASE}/upload`, { method: 'POST', body: formData })
-                            .then(r => {
-                                if (!r.ok) throw new Error('Ошибка сервера');
-                                return r.json();
-                            })
-                            .then(d => {
-                              alert(d.message || 'Файл успешно загружен');
-                              fetchDataStats();
-                              fetchDatasetPreview();
-                              loadStationsFromApi(station);
-                            })
-                            .catch(err => alert("Ошибка загрузки: " + err.message));
-                        }} />
-                      </label>
+                    {importMsg && (
+                      <div className={
+                        importMsg.kind === 'ok'
+                          ? "bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-xl px-4 py-3 text-sm mb-4"
+                          : "bg-red-50 border border-red-200 text-red-900 rounded-xl px-4 py-3 text-sm mb-4"
+                      }>
+                        {importMsg.text}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="border-2 border-dashed border-slate-200 bg-slate-50 rounded-xl p-5 flex flex-col">
+                        <h4 className="text-sm font-semibold text-slate-700 mb-1">Наблюдения (уровни воды)</h4>
+                        <p className="text-xs text-slate-500 mb-3">
+                          Обязательные колонки: river, post, date. Опционально: water_level_cm, temp_min/mean/max, precip_mm, snow_pct_norm, ice_thickness_cm. Дубликаты перезаписываются.
+                        </p>
+                        <div className="mt-auto flex flex-wrap gap-2">
+                          <button
+                            onClick={() => downloadTemplate('observations')}
+                            className="bg-slate-100 text-slate-700 text-xs font-medium px-3 py-2 rounded-lg hover:bg-slate-200 transition-colors border border-slate-200 inline-flex items-center gap-1.5"
+                          >
+                            <FileText className="w-3.5 h-3.5" /> Шаблон CSV
+                          </button>
+                          <label className="bg-blue-600 text-white text-xs font-medium px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-50">
+                            <Upload className="w-3.5 h-3.5" />
+                            {importing === 'observations' ? 'Импорт…' : 'Импортировать'}
+                            <input type="file" className="hidden" accept=".csv" disabled={importing !== null} onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              e.target.value = '';
+                              if (!file) return;
+                              importCsv('observations', file);
+                            }} />
+                          </label>
+                        </div>
+                      </div>
+                      <div className="border-2 border-dashed border-slate-200 bg-slate-50 rounded-xl p-5 flex flex-col">
+                        <h4 className="text-sm font-semibold text-slate-700 mb-1">Станции (гидропосты)</h4>
+                        <p className="text-xs text-slate-500 mb-3">
+                          Обязательные колонки: river, post. Опционально: lat, lon, low_oya, critical_oya, district, oktmo, name_ru. Существующие станции обновляются.
+                        </p>
+                        <div className="mt-auto flex flex-wrap gap-2">
+                          <button
+                            onClick={() => downloadTemplate('stations')}
+                            className="bg-slate-100 text-slate-700 text-xs font-medium px-3 py-2 rounded-lg hover:bg-slate-200 transition-colors border border-slate-200 inline-flex items-center gap-1.5"
+                          >
+                            <FileText className="w-3.5 h-3.5" /> Шаблон CSV
+                          </button>
+                          <label className="bg-blue-600 text-white text-xs font-medium px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-50">
+                            <Upload className="w-3.5 h-3.5" />
+                            {importing === 'stations' ? 'Импорт…' : 'Импортировать'}
+                            <input type="file" className="hidden" accept=".csv" disabled={importing !== null} onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              e.target.value = '';
+                              if (!file) return;
+                              importCsv('stations', file);
+                            }} />
+                          </label>
+                        </div>
+                      </div>
                     </div>
                   </div>
                   <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm flex flex-col">
