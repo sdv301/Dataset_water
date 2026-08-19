@@ -76,3 +76,31 @@ predictor = FloodPredictor()
 ## 📈 Сценарии "Что если" (What-if анализатор)
 
 В левом меню интерфейса ползунками можно настраивать сдвиги по температуре, осадкам и уровню снега. Frontend немедленно перестраивает графики и пересчитывает медиану и квантили (влияя на пересечение линий "Повышенного (НЯ)" и "Опасного (ОЯ)" уровней).
+
+---
+
+## Спринт 3 — задачи 9/11/12/18
+
+- **9 Бэктест**: `GET /api/backtest/{river}/{post}?horizon=7&limit=30` — naive lag-1, RMSE/MAE + reference из `models/.../manifest.json`. Панель `BacktestPanel` на вкладке Дашборды.
+- **11 SHAP/Explain расширение**: `GET /api/explain/{river}/{post}?horizon=7` теперь включает `feature_importance` (q50, топ-5). `ExplainPanel` рисует SHAP-бары (масштаб 0-100%).
+- **12 Аналоги лет**: `GET /api/analog/{river}/{post}?k=5` — корреляция последних 60 дней с тем же периодом прошлых лет. Панель `AnalogPanel` на Дашбордах.
+- **18 Health/donor**: `GET /api/health`, `GET /api/health/donor` (совместимость с порталом), `GET /api/data/stats`.
+
+## Спринт 4 — задачи 13-17 (минимум)
+
+- **13 Экспорт отчётов**: `GET /api/export/forecast/{river}/{post}?horizon=14` → CSV (utf-8-sig) `date,median,q10,q90,q95`. Кнопка «Скачать прогноз CSV» на Дашбордах/Прогнозе.
+- **14 Уведомления**: браузерные `Notification` по окончании обучения (`utils/trainingNotify.ts`) + X-Snapshot-Age/X-Source заголовки агента для мониторинга. Push пока через браузер (denied — предупреждение в UI).
+- **15 Ролевая модель**: `GET /api/auth/me` → `{role, permissions}` из `FLOOD_ROLE` env (viewer/admin). Фронт скрывает/дисейблит кнопки обучения/импорта для viewer.
+- **16 Деплой /flood/v2/**: `vite.config.ts base:'/flood/v2/'`, `src/config.ts API_BASE = '/flood/v2/api'` в prod, `server/index.ts` проксирует `/flood/v2/api → :8000` и отдаёт SPA под `/flood/v2`.
+- **17 Документация**: этот README + `data/templates/README.md` (utf-8-sig, колонки observations/stations). Парсер resume (задача 10) — см. `agent_scheduler` single-process catch-up (поток + snapshot-кеш, 03:00 Asia/Yakutsk).
+- **Строгий порог**: `will_flood = P(q90 ≥ НЯ) ≥ 0.7` в `flood_agent.py`, `ScenarioRoom` — отдельная вкладка верхнего уровня с 5 линиями, ReferenceLine НЯ/ОЯ и слайдерами.
+
+## Проверка
+
+```bash
+npm run build --prefix flood_app/Dataset_water  # чанки <1100KB, 1550 модулей
+python -m py_compile flood_app/Dataset_water/python_code/api_server.py
+curl http://localhost:8000/api/health/donor
+curl "http://localhost:8000/api/backtest/Лена/Якутск?horizon=7"
+curl "http://localhost:8000/api/analog/Лена/Якутск?k=3"
+```

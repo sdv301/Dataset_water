@@ -40,6 +40,7 @@ export const RefreshCw = createIcon([["path",{"d":"M3 12a9 9 0 0 1 9-9 9.75 9.75
 export const FileText = createIcon([["path",{"d":"M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z","key":"1rqfz7"}],["path",{"d":"M14 2v4a2 2 0 0 0 2 2h4","key":"tnqrlb"}],["path",{"d":"M10 9H8","key":"b1mrlr"}],["path",{"d":"M16 13H8","key":"t4e002"}],["path",{"d":"M16 17H8","key":"z1uh3a"}]]);
 export const Loader2 = createIcon([["path",{"d":"M21 12a9 9 0 1 1-6.219-8.56","key":"13zald"}]]);
 export const Crosshair = createIcon([["circle",{"cx":"12","cy":"12","r":"10","key":"1mglay"}],["line",{"x1":"22","x2":"18","y1":"12","y2":"12","key":"l9bcsi"}],["line",{"x1":"6","x2":"2","y1":"12","y2":"12","key":"13hhkx"}],["line",{"x1":"12","x2":"12","y1":"6","y2":"2","key":"10w3f3"}],["line",{"x1":"12","x2":"12","y1":"22","y2":"18","key":"15g9kq"}]]);
+export const Droplets = createIcon([["path",{"d":"M7 16.3c2.2 0 4-1.83 4-4.05 0-1.16-.57-2.26-1.71-3.19S7.29 6.75 7 5.3c-.29 1.45-1.14 2.84-2.29 3.76S3 11.1 3 12.25c0 2.22 1.8 4.05 4 4.05z","key":"1ptgy4"}],["path",{"d":"M12.56 6.6A10.97 10.97 0 0 0 14 3.02c.5 2.5 2 4.9 4 6.5s3 3.5 3 5.5a6.98 6.98 0 0 1-11.91 4.97","key":"1sl1rz"}]]);
 export const Search = createIcon([["path",{"d":"m21 21-4.34-4.34","key":"14j7rj"}],["circle",{"cx":"11","cy":"11","r":"8","key":"4ej97u"}]]);
 export const ChevronDown = createIcon([["path",{"d":"m6 9 6 6 6-6","key":"qrunsl"}]]);
 export const CheckCircle2 = createIcon([["circle",{"cx":"12","cy":"12","r":"10","key":"1mglay"}],["path",{"d":"m9 12 2 2 4-4","key":"dzmm74"}]]);

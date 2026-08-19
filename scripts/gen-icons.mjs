@@ -26,6 +26,7 @@ const icons = {
   FileText: 'file-text',
   Loader2: 'loader-circle',
   Crosshair: 'crosshair',
+  Droplets: 'droplets',
   Search: 'search',
   ChevronDown: 'chevron-down',
   CheckCircle2: 'circle-check',

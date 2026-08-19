@@ -6,7 +6,7 @@ import {
 import {
   Map, Activity, Calendar, LayoutDashboard, Settings2,
   Thermometer, CloudRain, Snowflake, AlertOctagon, TrendingUp, AlertTriangle, Plus, X, BarChart2,
-  Database, Upload, RefreshCw, FileText, Loader2, Crosshair,
+  Database, Upload, RefreshCw, FileText, Loader2, Crosshair, Droplets,
 } from './components/icons';
 import MapGL, { Marker, type ViewStateChangeEvent } from 'react-map-gl/maplibre';
 import 'maplibre-gl/dist/maplibre-gl.css';
@@ -21,6 +21,8 @@ import { StationSearchSelect } from './components/StationSearchSelect';
 import { FloodAgentPanel } from './components/FloodAgentPanel';
 import { AgentAlertsBadge } from './components/AgentAlertsBadge';
 import { ScenarioRoom } from './components/ScenarioRoom';
+import { BacktestPanel } from './components/BacktestPanel';
+import { AnalogPanel } from './components/AnalogPanel';
 import { notifyTrainingFinished, requestTrainingNotifications } from './utils/trainingNotify';
 import { API_BASE, MAP_SATELLITE_TILES_URL, MAP_SCHEME_TILES_URL } from './config';
 
@@ -241,6 +243,7 @@ export default function App() {
   const [scenarioPayload, setScenarioPayload] = useState<any>(null);
   const [priorityItems, setPriorityItems] = useState<any[]>([]);
   const [historyOnlyCurrent, setHistoryOnlyCurrent] = useState(false);
+  const [authRole, setAuthRole] = useState<string>('admin');
   
   // What If scenarios
   const [tempMod, setTempMod] = useState(0);
@@ -663,6 +666,18 @@ export default function App() {
       .then(d => setPriorityItems(Array.isArray(d.items) ? d.items : Array.isArray(d) ? d : []))
       .catch(() => setPriorityItems([]));
   }, [mode, currentStation]);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/auth/me`).then(r=>r.ok?r.json():null).then(d=>{ if(d?.role) setAuthRole(d.role); }).catch(()=>{});
+  }, []);
+
+  const downloadForecastCsv = useCallback(() => {
+    if (!currentStation) return;
+    const encR = encodeURIComponent(currentStation.river);
+    const encP = encodeURIComponent(currentStation.post);
+    const url = `${API_BASE}/export/forecast/${encR}/${encP}?horizon=14`;
+    window.open(url, '_blank');
+  }, [currentStation]);
 
   const { historyMapped, forecastMapped, forecastData } = React.useMemo(() => {
     const mapForecastPoint = (d: { date: string; median: number; q90?: number; q95?: number }) => {
@@ -1146,6 +1161,16 @@ export default function App() {
                     <h4 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2"><AlertOctagon className="w-4 h-4 text-red-500"/> Горячие посты <span className="text-xs font-normal text-slate-500">(GET /api/agent/priority)</span></h4>
                     {priorityItems.length===0 ? <p className="text-xs text-slate-500">Нет снимков агента — дождитесь ночного прогона 03:00 Asia/Yakutsk или запустите /api/agent/run.</p> : <ul className="space-y-1.5 max-h-[180px] overflow-auto pr-1">{priorityItems.slice(0,10).map((it:any,i:number)=><li key={`${it.river}-${it.post}-${i}`} className="flex items-center justify-between text-xs border border-slate-100 rounded-lg px-2 py-1.5 hover:bg-slate-50 cursor-pointer" onClick={()=>{const s=stations.find((x:any)=>x.river===it.river&&x.post===it.post); if(s) setStation(s.label);}}><span className="font-medium text-slate-700">{it.river} — {it.post}</span><span className={`px-1.5 py-0.5 rounded-full font-bold text-white ${it.risk_class==='critical'||it.risk_class==='high'?'bg-red-500':it.risk_class==='medium'?'bg-orange-500':'bg-emerald-500'}`}>{it.risk_class||it.will_flood?'НЯ+':''} {Math.round((it.confidence||0)*100)}%</span></li>)}</ul>}
                   </div>
+                </div>
+                {currentStation && (
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <BacktestPanel river={currentRiver} post={currentPost} />
+                    <AnalogPanel river={currentRiver} post={currentPost} />
+                  </div>
+                )}
+                <div className="flex gap-2">
+                  <button onClick={downloadForecastCsv} disabled={!currentStation} className="bg-blue-600 text-white text-xs font-medium px-3 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-40">Скачать прогноз CSV (14 дн)</button>
+                  {authRole === 'viewer' && <span className="text-xs text-slate-500 self-center">Режим просмотра — импорт/обучение отключены</span>}
                 </div>
                 <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-wrap gap-2 items-center">
                   <span className="text-sm font-semibold text-slate-700 mr-2 flex items-center gap-1"><LayoutDashboard className="w-4 h-4"/> Управление виджетами:</span>

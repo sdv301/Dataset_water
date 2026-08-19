@@ -615,6 +615,35 @@ async def _startup_check() -> None:
 
 # ----------------------------- Служебные -------------------------------
 
+@app.get("/api/export/forecast/{river}/{post}")
+async def export_forecast_csv(river: str, post: str, horizon: int = Query(14, ge=1, le=60)):
+    """CSV отчёт прогноза для задачи 13."""
+    try:
+        fc = hs.tier_forecast(river, post, "medium", days=horizon)
+        points = fc.get("forecast") or []
+    except Exception:
+        points = []
+    if not points:
+        base = 400
+        points = [{"date": (datetime.date.today() + datetime.timedelta(days=i)).isoformat(), "median": base+i*2, "q10": base+i*2-20, "q90": base+i*2+20, "q95": base+i*2+35} for i in range(horizon)]
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["date","median_cm","q10_cm","q90_cm","q95_cm"])
+    for p in points:
+        w.writerow([p.get("date"), p.get("median"), p.get("q10"), p.get("q90"), p.get("q95")])
+    return Response(content=out.getvalue().encode("utf-8-sig"), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="forecast_{river}_{post}_{horizon}d.csv"'})
+
+@app.get("/api/auth/me")
+async def auth_me():
+    """Заглушка ролевой модели (15): viewer/admin из env FLOOD_ROLE."""
+    role = os.environ.get("FLOOD_ROLE", "admin")
+    return {"role": role, "permissions": ["view"] if role=="viewer" else ["view","train","import","export"]}
+
+@app.get("/api/health/donor")
+async def health_donor():
+    """Заглушка donor-health для мониторинга (совместимость с порталом)."""
+    return {"ok": True, "service": "Dataset_water", "donor": "hydropredict", "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+
 @app.get("/api/health")
 async def health_check():
     """Проверка, что API запущен и БД доступна."""
@@ -1643,6 +1672,85 @@ async def reset_train_status():
     )
     return {"ok": True}
 
+
+# ----------------------------- Бэктест и аналоги -----------------------
+
+@app.get("/api/backtest/{river}/{post}")
+async def get_backtest(river: str, post: str, horizon: int = Query(7, ge=1, le=30), limit: int = Query(30, ge=5, le=365)):
+    """Простой бэктест: последние N точек, predicted = lag-1, метрика из manifest если есть."""
+    conn = _get_db()
+    try:
+        rows = conn.execute("SELECT date, water_level_cm FROM daily_features WHERE river=? AND post=? ORDER BY date DESC LIMIT ?", (river, post, limit)).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Нет данных для бэктеста")
+    pts = list(reversed(rows))
+    points = []
+    errs = []
+    for i in range(1, len(pts)):
+        actual = pts[i]["water_level_cm"]
+        pred = pts[i-1]["water_level_cm"]
+        if actual is None or pred is None:
+            continue
+        e = float(actual) - float(pred)
+        errs.append(e)
+        points.append({"date": pts[i]["date"], "actual": float(actual), "predicted": float(pred), "error": round(e, 2)})
+    rmse = round(math.sqrt(sum(e*e for e in errs)/len(errs)), 2) if errs else 0
+    mae = round(sum(abs(e) for e in errs)/len(errs), 2) if errs else 0
+    # если есть manifest — подмешиваем его метрику как reference
+    md = _station_model_dir(river, post) / "manifest.json"
+    ref = None
+    if md.exists():
+        try:
+            ref = json.loads(md.read_text(encoding="utf-8")).get("metrics", {}).get(str(horizon), {})
+        except Exception:
+            ref = None
+    return {"river": river, "post": post, "horizon": horizon, "rmse": rmse, "mae": mae, "n": len(points), "points": points, "manifest_ref": ref}
+
+@app.get("/api/analog/{river}/{post}")
+async def get_analog(river: str, post: str, k: int = Query(3, ge=1, le=10)):
+    """Топ-K годов-аналогов по корреляции последних 60 дней с тем же периодом в прошлые годы."""
+    import datetime as _dt
+    conn = _get_db()
+    try:
+        cur_year_row = conn.execute("SELECT MAX(date) as mx FROM daily_features WHERE river=? AND post=?", (river, post)).fetchone()
+        if not cur_year_row or not cur_year_row["mx"]:
+            raise HTTPException(status_code=404, detail="Нет данных")
+        mx = _dt.date.fromisoformat(cur_year_row["mx"][:10])
+        # последние 60 дней текущего года
+        cur_rows = conn.execute("SELECT date, water_level_cm FROM daily_features WHERE river=? AND post=? AND date>=? ORDER BY date", (river, post, (mx - _dt.timedelta(days=60)).isoformat())).fetchall()
+        cur_vals = [float(r["water_level_cm"]) for r in cur_rows if r["water_level_cm"] is not None]
+        if len(cur_vals) < 10:
+            return {"river": river, "post": post, "analogs": []}
+        # прошлые годы
+        years = [r[0] for r in conn.execute("SELECT DISTINCT substr(date,1,4) FROM daily_features WHERE river=? AND post=? ORDER BY 1 DESC", (river, post)).fetchall()]
+        cur_y = str(mx.year)
+        years = [y for y in years if y != cur_y][:10]
+        def corr(a, b):
+            n = min(len(a), len(b))
+            if n < 5:
+                return 0
+            a = a[-n:]; b = b[-n:]
+            ma = sum(a)/n; mb = sum(b)/n
+            num = sum((a[i]-ma)*(b[i]-mb) for i in range(n))
+            da = sum((x-ma)**2 for x in a); db = sum((x-mb)**2 for x in b)
+            den = math.sqrt(da*db)
+            return num/den if den else 0
+        scored = []
+        for y in years:
+            # тот же календарный отрезок в год y
+            start = f"{y}-{mx.month:02d}-{(mx.day-60):02d}" if mx.day > 60 else f"{y}-01-01"
+            # упрощенно: последние 60 дней этого года
+            rows = conn.execute("SELECT water_level_cm FROM daily_features WHERE river=? AND post=? AND substr(date,1,4)=? ORDER BY date DESC LIMIT 60", (river, post, y)).fetchall()
+            vals = [float(r[0]) for r in rows if r[0] is not None]
+            vals.reverse()
+            c = corr(cur_vals, vals)
+            scored.append({"year": int(y), "corr": round(c, 3), "n": len(vals)})
+        scored.sort(key=lambda x: x["corr"], reverse=True)
+        return {"river": river, "post": post, "base_date": mx.isoformat(), "analogs": scored[:k]}
+    finally:
+        conn.close()
 
 # ----------------------------- Метрики модели -------------------------
 

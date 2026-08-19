@@ -76,11 +76,14 @@ function ChartBox({ height, children }: { height: number; children: React.ReactE
 
 export function ExplainPanel({ explain, isMock }: { explain: any; isMock?: boolean }) {
   if (!explain) return null;
+  const fi = explain.feature_importance || {};
+  const fiEntries = Object.entries(fi).sort((a: any, b: any) => b[1] - a[1]).slice(0, 5) as [string, number][];
+  const maxFi = Math.max(...fiEntries.map(([, v]) => v), 1);
   return (
     <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-5 space-y-3">
       <div className="flex items-center gap-2 text-blue-800 font-semibold text-sm">
         <Info className="w-4 h-4" />
-        Почему такой прогноз
+        Почему такой прогноз {explain.horizon ? `· горизонт ${explain.horizon} дн.` : ''}
         {isMock && <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">демо</span>}
       </div>
       <p className="text-slate-700 text-sm leading-relaxed">{explain.narrative}</p>
@@ -90,6 +93,20 @@ export function ExplainPanel({ explain, isMock }: { explain: any; isMock?: boole
             <li key={i}><strong>{f.label}:</strong> {f.value} — {f.note}</li>
           ))}
         </ul>
+      )}
+      {fiEntries.length > 0 && (
+        <div className="pt-2 border-t border-blue-100">
+          <div className="text-xs font-semibold text-blue-900 mb-2">SHAP / важность признаков (топ-5, q50)</div>
+          <div className="space-y-1.5">
+            {fiEntries.map(([k, v]) => (
+              <div key={k} className="flex items-center gap-2 text-xs">
+                <span className="w-36 truncate text-slate-700" title={k}>{k}</span>
+                <div className="flex-1 h-2 bg-blue-100 rounded-full overflow-hidden"><div className="h-full bg-blue-600" style={{ width: `${Math.round((v / maxFi) * 100)}%` }} /></div>
+                <span className="w-12 text-right text-slate-600">{(v * 100).toFixed(1)}%</span>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );
