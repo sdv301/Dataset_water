@@ -20,11 +20,12 @@ import {
 import { StationSearchSelect } from './components/StationSearchSelect';
 import { FloodAgentPanel } from './components/FloodAgentPanel';
 import { AgentAlertsBadge } from './components/AgentAlertsBadge';
+import { ScenarioRoom } from './components/ScenarioRoom';
 import { notifyTrainingFinished, requestTrainingNotifications } from './utils/trainingNotify';
 import { API_BASE, MAP_SATELLITE_TILES_URL, MAP_SCHEME_TILES_URL } from './config';
 
 // --- Types & API ---
-type ForecastMode = 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data';
+type ForecastMode = 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data' | 'scenario';
 type WidgetId = 'cross_model' | 'scatter' | 'basin_risk' | 'feature_importance' | 'heatmap' | 'risk_pie' | 'peak_analysis';
 
 interface StationInfo {
@@ -640,7 +641,7 @@ export default function App() {
   }, [currentStation, targetDate, mode, yearSelected, normExcludeYear]);
 
   useEffect(() => {
-    if (!currentStation || (mode !== 'dashboards' && mode !== 'short' && mode !== 'medium')) return;
+    if (!currentStation || (mode !== 'dashboards' && mode !== 'short' && mode !== 'medium' && mode !== 'scenario')) return;
     const encR = encodeURIComponent(currentStation.river);
     const encP = encodeURIComponent(currentStation.post);
     const days = mode === 'short' ? 14 : 30;
@@ -729,6 +730,7 @@ export default function App() {
                 { id: 'year', label: 'Год', icon: TrendingUp },
                 { id: 'norm', label: 'Норма', icon: BarChart2 },
                 { id: 'dashboards', label: 'Дашборды', icon: LayoutDashboard },
+                { id: 'scenario', label: 'Комната сценариев', icon: Settings2 },
                 { id: 'data', label: 'Управление данными', icon: Database },
               ].map((item) => (
                 <button
@@ -938,6 +940,7 @@ export default function App() {
             {mode === 'year' && 'Годовой обзор'}
             {mode === 'norm' && 'Климатическая норма'}
             {mode === 'dashboards' && 'Сводные аналитические дашборды'}
+            {mode === 'scenario' && 'Комната сценариев (what-if, 30 дней)'}
             {mode === 'data' && 'Каталог данных и ретрейн моделей'}
           </h2>
           <div className="flex items-center gap-3">
@@ -1644,6 +1647,25 @@ export default function App() {
                       : '© CARTO, © OpenStreetMap contributors'}
                   </div>
                 </div>
+              </div>
+            )}
+
+            {mode === 'scenario' && (
+              <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                <p className="text-sm text-slate-600 bg-slate-50 border border-slate-200 rounded-xl px-4 py-3">
+                  Сценарии «что если» — 5 траекторий на 30 дней от базы {scenarioPayload?.base_date ? formatDateRu(scenarioPayload.base_date) : tierPayload?.base_date ? formatDateRu(tierPayload.base_date) : '—'}.
+                  Левый ползунок меняет «Ваш сценарий» (зелёная линия). Строгий вердикт затопления в агенте: <code className="bg-white border px-1 rounded">P(q90 ≥ НЯ) ≥ 0.7</code>.
+                  {!scenarioPayload?.has_model && ' Показан демо-прогноз — обучите модель станции.'}
+                </p>
+                <ScenarioRoom
+                  scenarios={scenarioPayload?.scenarios || []}
+                  warningLevel={warningLevel}
+                  dangerLevel={dangerLevel}
+                  baseDate={scenarioPayload?.base_date || tierPayload?.base_date}
+                  low={warningLevel}
+                  crit={dangerLevel}
+                  onThresholdChange={(low, crit) => { setWarningLevel(low); setDangerLevel(crit); }}
+                />
               </div>
             )}
 
