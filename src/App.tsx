@@ -1112,6 +1112,10 @@ export default function App() {
                   loading={forecastLoading}
                   forecastError={forecastError || undefined}
                 />
+                <div className="flex gap-2">
+                  <button onClick={downloadForecastCsv} disabled={!currentStation} className="bg-blue-600 text-white text-xs font-medium px-3 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-40">Скачать прогноз CSV (14 дн)</button>
+                  {authRole === 'viewer' && <span className="text-xs text-slate-500 self-center">Экспорт доступен, импорт/обучение — только admin</span>}
+                </div>
               </div>
             )}
 
@@ -1771,7 +1775,7 @@ export default function App() {
                           <label className="bg-blue-600 text-white text-xs font-medium px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-50">
                             <Upload className="w-3.5 h-3.5" />
                             {importing === 'observations' ? 'Импорт…' : 'Импортировать'}
-                            <input type="file" className="hidden" accept=".csv" disabled={importing !== null} onChange={(e) => {
+                            <input type="file" className="hidden" accept=".csv" disabled={importing !== null || authRole==='viewer'} onChange={(e) => {
                               const file = e.target.files?.[0];
                               e.target.value = '';
                               if (!file) return;
@@ -1795,7 +1799,7 @@ export default function App() {
                           <label className="bg-blue-600 text-white text-xs font-medium px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-50">
                             <Upload className="w-3.5 h-3.5" />
                             {importing === 'stations' ? 'Импорт…' : 'Импортировать'}
-                            <input type="file" className="hidden" accept=".csv" disabled={importing !== null} onChange={(e) => {
+                            <input type="file" className="hidden" accept=".csv" disabled={importing !== null || authRole==='viewer'} onChange={(e) => {
                               const file = e.target.files?.[0];
                               e.target.value = '';
                               if (!file) return;
@@ -1835,7 +1839,7 @@ export default function App() {
                             station,
                           ).catch(e => alert(e.message || 'API недоступен. Запустите: npm run start'));
                         }}
-                        disabled={trainingStatus.status === 'training'}
+                        disabled={trainingStatus.status === 'training' || authRole==='viewer'}
                         className="w-full bg-slate-800 text-white text-sm font-medium px-4 py-2.5 rounded-lg hover:bg-slate-900 transition-colors flex justify-center items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {trainingStatus.status === 'training' ? <><Loader2 className="w-4 h-4 animate-spin" /> Обучение…</> : 'Быстрое (~5–15 мин, 1 станция)'}
@@ -1851,7 +1855,7 @@ export default function App() {
                           if (!ok) return;
                           runTraining({ fast: false }, 'Все станции').catch(e => alert(e.message || 'API недоступен'));
                         }}
-                        disabled={trainingStatus.status === 'training'}
+                        disabled={trainingStatus.status === 'training' || authRole==='viewer'}
                         className="w-full bg-slate-100 text-slate-700 text-sm font-medium px-4 py-2.5 rounded-lg hover:bg-slate-200 transition-colors flex justify-center items-center gap-2 border border-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         Все станции (пакетное, ускоренное)
