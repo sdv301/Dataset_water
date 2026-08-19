@@ -239,6 +239,7 @@ export default function App() {
   const [normExcludeYear, setNormExcludeYear] = useState<number | null>(null);
   const [modelStatus, setModelStatus] = useState<any>(null);
   const [scenarioPayload, setScenarioPayload] = useState<any>(null);
+  const [priorityItems, setPriorityItems] = useState<any[]>([]);
   const [historyOnlyCurrent, setHistoryOnlyCurrent] = useState(false);
   
   // What If scenarios
@@ -654,6 +655,14 @@ export default function App() {
     }, 400);
     return () => window.clearTimeout(t);
   }, [currentStation, mode, tempMod, precipMod, snowMod]);
+
+  useEffect(() => {
+    if (mode !== 'dashboards') return;
+    fetch(`${API_BASE}/agent/priority?limit=20`)
+      .then(r => r.ok ? r.json() : { items: [] })
+      .then(d => setPriorityItems(Array.isArray(d.items) ? d.items : Array.isArray(d) ? d : []))
+      .catch(() => setPriorityItems([]));
+  }, [mode, currentStation]);
 
   const { historyMapped, forecastMapped, forecastData } = React.useMemo(() => {
     const mapForecastPoint = (d: { date: string; median: number; q90?: number; q95?: number }) => {
@@ -1128,6 +1137,16 @@ export default function App() {
                   )}
                   {' '}Пики паводка <strong>по календарному году</strong> — только во вкладке «Год».
                 </p>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                    <h4 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2"><Droplets className="w-4 h-4 text-blue-500"/> Сводка по бассейнам</h4>
+                    {(() => { const byRiver = stations.reduce((a:any,s:any)=>{ (a[s.river]=a[s.river]||{total:0,high:0,med:0}).total++; if(s.risk==='high'||s.risk==='critical') a[s.river].high++; else if(s.risk==='medium') a[s.river].med++; return a;},{} as any); const rows=Object.entries(byRiver).sort((a:any,b:any)=>b[1].high-a[1].high).slice(0,8); return rows.length===0 ? <p className="text-xs text-slate-500">Нет данных</p> : <ul className="space-y-1.5">{rows.map(([river,v]:any)=><li key={river} className="flex items-center justify-between text-xs"><span className="font-medium text-slate-700">{river}</span><span className="flex gap-2"><span className="text-slate-500">{v.total} постов</span>{v.high>0&&<span className="bg-red-100 text-red-700 px-1.5 py-0.5 rounded-full font-semibold">{v.high} ОЯ</span>}{v.med>0&&<span className="bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded-full font-semibold">{v.med} НЯ</span>}</span></li>)}</ul>; })()}
+                  </div>
+                  <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                    <h4 className="text-sm font-semibold text-slate-800 mb-3 flex items-center gap-2"><AlertOctagon className="w-4 h-4 text-red-500"/> Горячие посты <span className="text-xs font-normal text-slate-500">(GET /api/agent/priority)</span></h4>
+                    {priorityItems.length===0 ? <p className="text-xs text-slate-500">Нет снимков агента — дождитесь ночного прогона 03:00 Asia/Yakutsk или запустите /api/agent/run.</p> : <ul className="space-y-1.5 max-h-[180px] overflow-auto pr-1">{priorityItems.slice(0,10).map((it:any,i:number)=><li key={`${it.river}-${it.post}-${i}`} className="flex items-center justify-between text-xs border border-slate-100 rounded-lg px-2 py-1.5 hover:bg-slate-50 cursor-pointer" onClick={()=>{const s=stations.find((x:any)=>x.river===it.river&&x.post===it.post); if(s) setStation(s.label);}}><span className="font-medium text-slate-700">{it.river} — {it.post}</span><span className={`px-1.5 py-0.5 rounded-full font-bold text-white ${it.risk_class==='critical'||it.risk_class==='high'?'bg-red-500':it.risk_class==='medium'?'bg-orange-500':'bg-emerald-500'}`}>{it.risk_class||it.will_flood?'НЯ+':''} {Math.round((it.confidence||0)*100)}%</span></li>)}</ul>}
+                  </div>
+                </div>
                 <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-wrap gap-2 items-center">
                   <span className="text-sm font-semibold text-slate-700 mr-2 flex items-center gap-1"><LayoutDashboard className="w-4 h-4"/> Управление виджетами:</span>
                   {AVAILABLE_WIDGETS.map(w => {
