@@ -10,3 +10,4 @@ uvicorn>=0.23
 python-multipart>=0.0.6
 openpyxl>=3.1
 aiofiles>=23.0
+shap>=0.44

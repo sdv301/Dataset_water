@@ -399,7 +399,7 @@ def _forecast_daily(
         predictor = hs.load_predictor(river, post)
         if not predictor:
             return [], False
-        pts = hs.forecast_points_from_predictor(predictor, base, horizon, low, crit) or []
+        pts = hs.forecast_points_from_predictor(predictor, base, horizon, low, crit, river=river, post=post) or []
     except Exception:
         return [], False
     return pts, True

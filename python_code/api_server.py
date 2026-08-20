@@ -655,6 +655,127 @@ async def health_check():
     }
 
 
+# --------------------------- Аудит-эндпоинты ---------------------------
+
+@app.get("/api/data/coverage/{river}/{post}")
+async def get_data_coverage_endpoint(river: str, post: str):
+    """Диагностика покрытия исходных признаков поста (temp/precip/snow/ice/уровень).
+
+    Используется виджетом «Почему нет температуры / снега / льда» на фронте.
+    """
+    try:
+        return hs.get_data_coverage(river, post)
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="БД не найдена")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"coverage error: {e}")
+
+
+@app.post("/api/calibrate/{river}/{post}")
+async def calibrate_station(
+    river: str,
+    post: str,
+    horizon: str = Query("7", description="Горизонт в днях либо 'all' — калибровать все обученные."),
+    level: str = Query("low", regex="^(low|crit|both)$"),
+    min_samples: int = Query(50, ge=20, le=1000),
+):
+    """Обучает изотоническую калибровку `P(превышение)` для (river, post, horizon, level).
+
+    - `horizon=all` — перебирает все обученные горизонты станции.
+    - `level=both`  — калибрует и НЯ, и ОЯ.
+    Модель сохраняется в `models/<river>/<post>/isotonic_h{h}_{level}.joblib` и
+    автоматически применяется в дальнейшем прогнозе через `apply_isotonic_calibration`.
+    """
+    # список горизонтов
+    if str(horizon).lower() == "all":
+        predictor = hs.load_predictor(river, post)
+        if not predictor:
+            raise HTTPException(status_code=404, detail="Модель не обучена для станции")
+        horizons = sorted(int(h) for h in predictor.models.keys())
+        if not horizons:
+            raise HTTPException(status_code=404, detail="Нет обученных горизонтов")
+    else:
+        try:
+            h_int = int(horizon)
+            if not (1 <= h_int <= 60):
+                raise ValueError
+        except ValueError:
+            raise HTTPException(status_code=422, detail="horizon должен быть 1..60 или 'all'")
+        horizons = [h_int]
+
+    levels = ["low", "crit"] if level == "both" else [level]
+
+    results: list[dict] = []
+    ok_cnt = 0
+    for h in horizons:
+        for lv in levels:
+            try:
+                r = hs.fit_isotonic_calibrator(river, post, horizon=h, level=lv, min_samples=min_samples)
+            except Exception as e:
+                r = {"ok": False, "error": f"calibrate error: {e}"}
+            r["horizon"] = h
+            r["level"] = lv
+            if r.get("ok"):
+                ok_cnt += 1
+            results.append(r)
+
+    if ok_cnt == 0:
+        # если все упали — вернуть первую ошибку 400, чтобы UI показал причину
+        raise HTTPException(status_code=400, detail=results[0].get("error") or "Не удалось откалибровать")
+    return {
+        "ok": True,
+        "river": river,
+        "post": post,
+        "trained": ok_cnt,
+        "total": len(results),
+        "results": results,
+    }
+
+
+
+@app.get("/api/drift/{river}/{post}")
+async def get_drift(river: str, post: str, train_window: int = Query(730, ge=180, le=1825), recent_window: int = Query(180, ge=30, le=730)):
+    """KS-тест дрейфа распределений (scipy.stats.ks_2samp)."""
+    try:
+        res = hs.compute_data_drift(river, post, train_window=train_window, recent_window=recent_window)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"drift error: {e}")
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error") or "drift error")
+    return res
+
+
+@app.get("/api/reliability/{river}/{post}")
+async def get_reliability(river: str, post: str, horizon: int = Query(7, ge=1, le=60), level: str = Query("low", regex="^(low|crit)$"), n_bins: int = Query(10, ge=5, le=20)):
+    """Reliability diagram для P(превышение) с Brier/ECE."""
+    try:
+        res = hs.compute_reliability(river, post, horizon=horizon, level=level, n_bins=n_bins)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"reliability error: {e}")
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error") or "reliability error")
+    return res
+
+
+@app.get("/api/explain/shap")
+async def explain_shap(
+    river: str = Query(...),
+    post: str = Query(...),
+    horizon: int = Query(7, ge=1, le=60),
+    quantile: float = Query(0.5, ge=0.05, le=0.95),
+    top_k: int = Query(10, ge=3, le=30),
+):
+    """SHAP-объяснение прогноза (top-k вкладов признаков).
+
+    Если библиотека `shap` не установлена — возвращает fallback на
+    `predictor.get_feature_importance()` с RU-названиями.
+    """
+    try:
+        return hs.get_shap_explanation(river, post, horizon=horizon, quantile=quantile, top_k=top_k)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"shap error: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Глобальный обработчик исключений — чтобы 500-ки не были «немыми».
 # ---------------------------------------------------------------------------

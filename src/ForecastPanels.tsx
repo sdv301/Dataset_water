@@ -74,38 +74,97 @@ function ChartBox({ height, children }: { height: number; children: React.ReactE
   );
 }
 
-export function ExplainPanel({ explain, isMock }: { explain: any; isMock?: boolean }) {
-  if (!explain) return null;
-  const fi = explain.feature_importance || {};
-  const fiEntries = Object.entries(fi).sort((a: any, b: any) => b[1] - a[1]).slice(0, 5) as [string, number][];
-  const maxFi = Math.max(...fiEntries.map(([, v]) => v), 1);
+const FEATURE_LABELS_RU: Record<string, string> = {
+  month: 'Месяц',
+  day_of_year: 'День года',
+  doy: 'День года',
+  sin_doy: 'Сезонность (sin)',
+  cos_doy: 'Сезонность (cos)',
+  level_ma7: 'Средний уровень 7д',
+  level_ma14: 'Средний уровень 14д',
+  level_ma30: 'Средний уровень 30д',
+  level_ma60: 'Средний уровень 60д',
+  temp_mean: 'Температура сред.',
+  temp_ma7: 'Температура 7д',
+  temp_ma14: 'Температура 14д',
+  precip_mm: 'Осадки, мм',
+  precip_sum7: 'Осадки 7д, мм',
+  precip_sum14: 'Осадки 14д, мм',
+  snow_depth_cm: 'Высота снега, см',
+  snow_pct_norm: 'Снег, % от нормы',
+  ice_thickness_cm: 'Толщина льда, см',
+  ice_flag: 'Ледостав',
+  water_level_lag1: 'Уровень вчера',
+  water_level_lag7: 'Уровень 7 дн. назад',
+  trend_7d: 'Тренд 7д',
+  trend_14d: 'Тренд 14д',
+};
+
+function translateFeature(name: string): string {
+  if (!name) return name;
+  if (FEATURE_LABELS_RU[name]) return FEATURE_LABELS_RU[name];
+  const low = name.toLowerCase();
+  if (FEATURE_LABELS_RU[low]) return FEATURE_LABELS_RU[low];
+  return name;
+}
+
+export function ExplainPanel({ explain, isMock, shapData }: { explain: any; isMock?: boolean; shapData?: any }) {
+  const [tab, setTab] = useState<'bars' | 'table'>('bars');
+  if (!explain && !shapData) return null;
+  const shapValues: { feature: string; key?: string; value: number; abs?: number }[] = shapData?.values || [];
+  const fiEntries = shapValues.length
+    ? shapValues.map(v => [translateFeature(v.feature), v.value] as [string, number])
+    : (Object.entries((explain?.feature_importance || {}) as Record<string, number>).sort((a: any, b: any) => b[1] - a[1]).slice(0, 5) as [string, number][]).map(([k, v]) => [translateFeature(k), v] as [string, number]);
+  const maxFi = Math.max(...fiEntries.map(([, v]) => Math.abs(v)), 1);
+  const baseVal = shapData?.base_value;
+  const method = shapData?.method;
   return (
     <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-5 space-y-3">
       <div className="flex items-center gap-2 text-blue-800 font-semibold text-sm">
         <Info className="w-4 h-4" />
-        Почему такой прогноз {explain.horizon ? `· горизонт ${explain.horizon} дн.` : ''}
+        Почему такой прогноз {explain?.horizon ? `· горизонт ${explain.horizon} дн.` : ''}
         {isMock && <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">демо</span>}
+        {method && <span className="text-[10px] bg-white border border-blue-200 text-blue-700 px-2 py-0.5 rounded-full">{method}</span>}
       </div>
-      <p className="text-slate-700 text-sm leading-relaxed">{explain.narrative}</p>
-      {explain.factors?.length > 0 && (
+      {explain?.narrative && <p className="text-slate-700 text-sm leading-relaxed">{explain.narrative}</p>}
+      {explain?.factors?.length > 0 && (
         <ul className="text-xs text-slate-600 space-y-1">
-          {explain.factors.map((f: any, i: number) => (
-            <li key={i}><strong>{f.label}:</strong> {f.value} — {f.note}</li>
-          ))}
+          {explain.factors.map((f: any, i: number) => (<li key={i}><strong>{f.label}:</strong> {f.value} — {f.note}</li>))}
         </ul>
       )}
-      {fiEntries.length > 0 && (
+      {(fiEntries.length > 0) && (
         <div className="pt-2 border-t border-blue-100">
-          <div className="text-xs font-semibold text-blue-900 mb-2">SHAP / важность признаков (топ-5, q50)</div>
-          <div className="space-y-1.5">
-            {fiEntries.map(([k, v]) => (
-              <div key={k} className="flex items-center gap-2 text-xs">
-                <span className="w-36 truncate text-slate-700" title={k}>{k}</span>
-                <div className="flex-1 h-2 bg-blue-100 rounded-full overflow-hidden"><div className="h-full bg-blue-600" style={{ width: `${Math.round((v / maxFi) * 100)}%` }} /></div>
-                <span className="w-12 text-right text-slate-600">{(v * 100).toFixed(1)}%</span>
-              </div>
-            ))}
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs font-semibold text-blue-900">Вклады признаков</span>
+            <div className="ml-auto flex bg-white rounded-full border border-blue-200 p-0.5 text-[11px]">
+              <button onClick={() => setTab('bars')} className={`px-2 py-0.5 rounded-full ${tab === 'bars' ? 'bg-blue-600 text-white' : 'text-slate-600'}`}>Бары</button>
+              <button onClick={() => setTab('table')} className={`px-2 py-0.5 rounded-full ${tab === 'table' ? 'bg-blue-600 text-white' : 'text-slate-600'}`}>Таблица</button>
+            </div>
           </div>
+          {baseVal != null && <p className="text-[11px] text-slate-500 mb-2">base_value: {baseVal}</p>}
+          {tab === 'bars' ? (
+            <div className="space-y-1.5">
+              {fiEntries.map(([k, v]) => {
+                const isNeg = v < 0;
+                return (
+                  <div key={k} className="flex items-center gap-2 text-xs">
+                    <span className="w-36 truncate text-slate-700" title={k}>{k}</span>
+                    <div className="flex-1 h-2 bg-blue-100 rounded-full overflow-hidden flex"><div className={`h-full ${isNeg ? 'bg-amber-500' : 'bg-blue-600'}`} style={{ width: `${Math.round((Math.abs(v) / maxFi) * 100)}%` }} /></div>
+                    <span className={`w-16 text-right ${isNeg ? 'text-amber-700' : 'text-slate-600'}`}>{Math.abs(v) > 1 ? v.toFixed(3) : (v * 100).toFixed(1) + '%'}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="overflow-auto max-h-64 border border-blue-100 rounded-lg bg-white">
+              <table className="w-full text-xs">
+                <thead className="bg-blue-50 text-blue-900 sticky top-0"><tr><th className="text-left px-2 py-1">Признак</th><th className="text-right px-2 py-1">Вклад</th><th className="text-right px-2 py-1">|Вклад|</th></tr></thead>
+                <tbody>{fiEntries.map(([k, v]) => <tr key={k} className="border-t border-slate-100"><td className="px-2 py-1 text-slate-700">{k}</td><td className="px-2 py-1 text-right font-mono">{typeof v === 'number' ? v.toFixed(4) : String(v)}</td><td className="px-2 py-1 text-right text-slate-500">{Math.abs(v as number).toFixed(4)}</td></tr>)}</tbody>
+              </table>
+            </div>
+          )}
+          {shapData?.note && <p className="text-[11px] text-slate-500 mt-2">{shapData.note}</p>}
+          {shapData?.error && <p className="text-[11px] text-red-600 mt-1">Ошибка SHAP: {shapData.error}</p>}
         </div>
       )}
     </div>
@@ -777,27 +836,30 @@ export function ClimatologyChart({
     return {
       date: dateFull,
       dateShort: dm,
+      dateLong: p.date_label_long || dm,
+      doy: p.day_of_year,
       histMean: p.hist_mean,
       histMin: p.hist_min,
       histMax: p.hist_max,
     };
   });
+  const excludeYearLabel = excludeYear ? ` (${excludeYear})` : ` (${new Date().getFullYear()})`;
 
   return (
     <div className="bg-white p-6 rounded-2xl border border-slate-200">
       <h3 className="font-semibold mb-2">Многолетняя климатическая норма</h3>
       <p className="text-xs text-slate-500 mb-3">
         Средний, минимальный и максимальный уровень по всем годам наблюдений в БД для каждого календарного дня (дд.мм).
-        Это не уровни одного конкретного года.
+        Данные уже отсортированы по дню года.
       </p>
       {onExcludeYearChange && (
         <label className="flex items-center gap-2 text-xs text-slate-600 mb-4 cursor-pointer">
           <input
             type="checkbox"
             checked={excludeYear != null && excludeYear > 0}
-            onChange={e => onExcludeYearChange(e.target.checked ? new Date().getFullYear() : null)}
+            onChange={e => onExcludeYearChange(e.target.checked ? (excludeYear && excludeYear > 0 ? excludeYear : new Date().getFullYear()) : null)}
           />
-          Исключить текущий календарный год из расчёта нормы
+          Исключить календарный год{excludeYearLabel} из расчёта нормы
         </label>
       )}
       <ChartBox height={340}>
@@ -815,7 +877,7 @@ export function ClimatologyChart({
           <RechartsTooltip
             labelFormatter={(_, payload) => {
               const p = payload?.[0]?.payload;
-              return p?.date ? `Дата: ${p.date}` : '';
+              return p ? `${p.dateLong || p.dateShort}${p.doy ? ` — день ${p.doy}` : ''}` : '';
             }}
             formatter={(value: number, name: string) => [
               value != null ? `${Math.round(value)} см` : '—',
@@ -824,10 +886,107 @@ export function ClimatologyChart({
           />
           <Legend />
           <Line dataKey="histMean" stroke="#2563eb" dot={false} name="Средний уровень" strokeWidth={2} />
-          <Line dataKey="histMin" stroke="#94a3b8" strokeDasharray="2 2" dot={false} name="Мин" />
-          <Line dataKey="histMax" stroke="#f97316" strokeDasharray="2 2" dot={false} name="Макс" />
+          <Line dataKey="histMin" stroke="#94a3b8" strokeDasharray="2 2" dot={false} name="Минимум" />
+          <Line dataKey="histMax" stroke="#f97316" strokeDasharray="2 2" dot={false} name="Максимум" />
         </ComposedChart>
       </ChartBox>
     </div>
   );
 }
+
+// ---- Аудит-виджеты портала (coverage, precip×level, ice timeline, duration) ----
+
+export function CoverageBar({ coverage }: { coverage: any }) {
+  if (!coverage || !coverage.fields) return null;
+  return (
+    <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <h4 className="text-sm font-semibold text-slate-800">Покрытие данных</h4>
+        <span className="text-xs text-slate-500">{coverage.total_days} дней в БД</span>
+      </div>
+      <div className="space-y-2">
+        {coverage.fields.map((f: any) => (
+          <div key={f.field} className="flex items-center gap-2 text-xs">
+            <span className="w-40 truncate text-slate-600" title={f.field}>{f.field}</span>
+            <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">
+              <div className={`h-full ${f.pct < 20 ? 'bg-red-500' : f.pct < 60 ? 'bg-amber-500' : 'bg-emerald-500'}`} style={{ width: `${f.pct}%` }} />
+            </div>
+            <span className="w-12 text-right text-slate-600">{f.pct}%</span>
+            <span className="w-20 text-right text-slate-400">{f.filled}/{f.total}</span>
+          </div>
+        ))}
+      </div>
+      {coverage.hint && (
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">{coverage.hint}</p>
+      )}
+    </div>
+  );
+}
+
+export function DualAxisPrecipLevelChart({ history }: { history: any[] }) {
+  const data = (history || []).slice(-90).map((r: any) => ({
+    date: formatDateRu(r.date, 'dd.MM'),
+    level: r.water_level_cm,
+    precip: r.precip_mm,
+  }));
+  if (!data.length) return <div className="text-sm text-slate-500 p-6 border border-dashed rounded-xl">Нет истории для графика «осадки × уровень»</div>;
+  return (
+    <div className="bg-white p-4 rounded-2xl border border-slate-200">
+      <h4 className="font-semibold text-sm mb-2">Осадки × уровень (последние 90 дней)</h4>
+      <ChartBox height={300}>
+        <ComposedChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey="date" fontSize={10} minTickGap={16} />
+          <YAxis yAxisId="left" fontSize={11} unit=" см" />
+          <YAxis yAxisId="right" orientation="right" fontSize={11} unit=" мм" />
+          <RechartsTooltip />
+          <Legend />
+          <Bar yAxisId="right" dataKey="precip" name="Осадки, мм" fill="#60a5fa" opacity={0.7} barSize={6} />
+          <Line yAxisId="left" type="monotone" dataKey="level" name="Уровень, см" stroke="#0f172a" dot={false} strokeWidth={1.8} />
+        </ComposedChart>
+      </ChartBox>
+    </div>
+  );
+}
+
+export function IceTimeline({ history }: { history: any[] }) {
+  const rows = (history || []).filter((r: any) => r.ice_event || r.ice_thickness_cm != null).slice(-120);
+  if (!rows.length) return <div className="text-sm text-slate-500 p-6 border border-dashed rounded-xl">Нет данных о ледовом режиме</div>;
+  return (
+    <div className="bg-white p-4 rounded-2xl border border-slate-200">
+      <h4 className="font-semibold text-sm mb-2">Ледовый режим (таймлайн)</h4>
+      <div className="space-y-1 max-h-64 overflow-auto text-xs">
+        {rows.map((r: any, i: number) => (
+          <div key={i} className="flex items-center gap-2 border-b border-slate-50 py-1">
+            <span className="w-20 text-slate-500">{formatDateRu(r.date, 'dd.MM.yyyy')}</span>
+            <span className="flex-1 text-slate-700 truncate">{r.ice_event || '—'}</span>
+            <span className="w-20 text-right text-slate-600">{r.ice_thickness_cm != null ? `${r.ice_thickness_cm} см` : '—'}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function DurationCurve({ history }: { history: any[] }) {
+  const vals = (history || []).map((r: any) => r.water_level_cm).filter((v: any) => v != null).map(Number).sort((a: number, b: number) => b - a);
+  if (!vals.length) return <div className="text-sm text-slate-500 p-6 border border-dashed rounded-xl">Нет данных для кривой продолжительности</div>;
+  const n = vals.length;
+  const data = vals.map((v: number, i: number) => ({ p: Math.round((i / Math.max(1, n - 1)) * 100), level: v }));
+  return (
+    <div className="bg-white p-4 rounded-2xl border border-slate-200">
+      <h4 className="font-semibold text-sm mb-2">Кривая продолжительности уровня</h4>
+      <p className="text-xs text-slate-500 mb-2">По оси X — обеспеченность (% времени, когда уровень был не ниже указанного).</p>
+      <ChartBox height={280}>
+        <ComposedChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" vertical={false} />
+          <XAxis dataKey="p" fontSize={11} unit="%" />
+          <YAxis fontSize={11} unit=" см" />
+          <RechartsTooltip formatter={(v: any) => [`${v} см`, 'Уровень']} labelFormatter={(l: any) => `${l}% обеспеченности`} />
+          <Line type="monotone" dataKey="level" name="Уровень" stroke="#2563eb" dot={false} strokeWidth={2} />
+        </ComposedChart>
+      </ChartBox>
+    </div>
+  );
+}
+

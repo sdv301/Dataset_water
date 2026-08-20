@@ -246,6 +246,8 @@ def forecast_points_from_predictor(
     low_oya: float,
     critical_oya: float,
     preferred_horizons: Optional[List[int]] = None,
+    river: Optional[str] = None,
+    post: Optional[str] = None,
 ) -> List[dict]:
     points = []
     trained = sorted(int(h) for h in predictor.models.keys())
@@ -264,6 +266,20 @@ def forecast_points_from_predictor(
         if not res:
             continue
         median = float(res.get("median", 0))
+        pw = res.get("prob_warning")
+        pd = res.get("prob_danger")
+        # Изотоническая калибровка p_exceed, если калибратор уже обучен (иначе — сырая оценка)
+        if river and post and use_h is not None:
+            if pw is not None:
+                try:
+                    pw = apply_isotonic_calibration(float(pw), river, post, horizon=use_h, level="low")
+                except Exception:
+                    pass
+            if pd is not None:
+                try:
+                    pd = apply_isotonic_calibration(float(pd), river, post, horizon=use_h, level="crit")
+                except Exception:
+                    pass
         points.append({
             "date": target.isoformat(),
             "median": round(median, 2),
@@ -271,8 +287,8 @@ def forecast_points_from_predictor(
             "q90": round(float(res.get("q90", median * 1.15)), 2),
             "q95": round(float(res.get("q95", median * 1.2)), 2),
             "horizon_used": use_h,
-            "prob_warning": res.get("prob_warning"),
-            "prob_danger": res.get("prob_danger"),
+            "prob_warning": pw,
+            "prob_danger": pd,
         })
     return points
 
@@ -312,7 +328,9 @@ def compute_climatology(river: str, post: str, exclude_year: Optional[int] = Non
         precip_mm=("precip_mm", "mean"),
         snow_pct_norm=("snow_pct_norm", "mean"),
         ice_thickness_cm=("ice_thickness_cm", "mean"),
-    ).reset_index()
+    ).reset_index().sort_values("doy")
+    # 29.02 (doy=60 в високосный год) слабо покрыт наблюдениями — оставляем,
+    # но сортировка по doy гарантирует непрерывный ход графика 01.01 → 31.12.
 
     result = []
     for _, row in agg.iterrows():
@@ -354,6 +372,8 @@ def season_forecast_blend(
     critical_oya: float,
     climatology: List[dict],
     days: int = 90,
+    river = None,
+    post = None,
 ) -> List[dict]:
     h30 = forecast_points_from_predictor(
         predictor,
@@ -362,6 +382,7 @@ def season_forecast_blend(
         low_oya=low_oya,
         critical_oya=critical_oya,
         preferred_horizons=[30] if 30 in predictor.models else [14, 7],
+        river=river, post=post,
     )
     clim_map = {c["day_of_year"]: c for c in climatology}
     for pt in h30:
@@ -607,6 +628,8 @@ def _forecast_map_for_calendar_year(
     crit: float,
     clim_map: Dict[int, dict],
     view_type: str,
+    river: Optional[str] = None,
+    post: Optional[str] = None,
 ) -> Dict[str, dict]:
     """
     Прогноз на каждый день календарного года: rollout модели + климатология для пробелов.
@@ -619,6 +642,7 @@ def _forecast_map_for_calendar_year(
     pts = forecast_points_from_predictor(
         predictor, base, span_days, low, crit,
         preferred_horizons=[30, 14, 7, 3, 1],
+        river=river, post=post,
     )
     by_doy: Dict[int, dict] = {}
     for p in pts:
@@ -719,7 +743,7 @@ def build_scenario_forecasts(
 
     predictor = load_predictor(river, post)
     if predictor:
-        baseline_pts = forecast_points_from_predictor(predictor, base, days, low, crit)
+        baseline_pts = forecast_points_from_predictor(predictor, base, days, low, crit, river=river, post=post)
     else:
         tier = tier_forecast(river, post, "medium", days=days, base_date=base)
         baseline_pts = tier.get("forecast") or []
@@ -865,9 +889,10 @@ def build_year_analytics(
     if predictor and view_type in ("future", "mixed"):
         forecast_map = _forecast_map_for_calendar_year(
             display_year, base, predictor, low, crit, clim_map, view_type,
+            river=river, post=post,
         )
     elif predictor and view_type == "past":
-        pts = forecast_points_from_predictor(predictor, base, days=120, low_oya=low, critical_oya=crit)
+        pts = forecast_points_from_predictor(predictor, base, days=120, low_oya=low, critical_oya=crit, river=river, post=post)
         for p in pts:
             try:
                 if datetime.date.fromisoformat(p["date"]).year == display_year:
@@ -1071,11 +1096,12 @@ def tier_forecast(
     if predictor:
         if tier == "season":
             clim = compute_climatology(river, post)
-            points = season_forecast_blend(predictor, base_date, low, crit, clim, days=days)
+            points = season_forecast_blend(predictor, base_date, low, crit, clim, days=days, river=river, post=post)
         else:
             horizons = TIER_HORIZONS.get(tier, [7])
             points = forecast_points_from_predictor(
                 predictor, base_date, days, low, crit, preferred_horizons=horizons,
+                river=river, post=post,
             )
 
     max_q95 = max((p.get("q95", 0) for p in points), default=0.0)
@@ -1446,6 +1472,148 @@ def get_last_training_for_station(river: str, post: str) -> Optional[dict]:
         conn.close()
 
 
+def get_data_coverage(river: str, post: str) -> dict:
+    """Покрытие ключевых признаков для поста: temp/precip/snow/ice/уровень.
+    Используется для блока «Почему нет температуры» и /api/data/coverage.
+    """
+    conn = get_db()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM daily_features WHERE river=? AND post=?",
+            (river, post),
+        ).fetchone()["cnt"]
+        if total == 0:
+            return {"river": river, "post": post, "total_days": 0, "fields": [], "temp_fill_pct": 0, "precip_fill_pct": 0, "snow_fill_pct": 0, "ice_fill_pct": 0}
+        cols = ["water_level_cm", "temp_mean", "precip_mm", "snow_pct_norm", "ice_thickness_cm", "snow_depth_cm", "ice_event"]
+        fields = []
+        for c in cols:
+            try:
+                cnt = conn.execute(
+                    f'SELECT COUNT(*) AS cnt FROM daily_features WHERE river=? AND post=? AND "{c}" IS NOT NULL',
+                    (river, post),
+                ).fetchone()["cnt"]
+            except sqlite3.OperationalError:
+                cnt = 0
+            pct = round(100 * cnt / total, 1) if total else 0
+            fields.append({"field": c, "filled": cnt, "total": total, "pct": pct})
+        by = {f["field"]: f["pct"] for f in fields}
+        return {
+            "river": river, "post": post,
+            "total_days": total,
+            "fields": fields,
+            "temp_fill_pct": by.get("temp_mean", 0),
+            "precip_fill_pct": by.get("precip_mm", 0),
+            "snow_fill_pct": by.get("snow_pct_norm", 0),
+            "ice_fill_pct": by.get("ice_thickness_cm", 0),
+            "snow_depth_fill_pct": by.get("snow_depth_cm", 0),
+            "ice_event_fill_pct": by.get("ice_event", 0),
+            "hint": (
+                "temp_mean пуст — проверьте dannie_meteo_codes.csv и связку метео-постов в prepare_ml_data.py; "
+                "или загрузите CSV с колонкой temp_mean через POST /api/data/import/observations"
+                if by.get("temp_mean", 0) < 5 else None
+            ),
+        }
+    finally:
+        conn.close()
+
+
+
+def compute_data_drift(river: str, post: str, train_window: int = 730, recent_window: int = 180) -> dict:
+    import pandas as pd
+    import numpy as np
+    try:
+        from scipy.stats import ks_2samp
+    except Exception:
+        return {'ok': False, 'error': 'scipy not installed'}
+    conn=get_db()
+    try:
+        df=pd.read_sql_query('SELECT date, water_level_cm, temp_mean, precip_mm, snow_pct_norm FROM daily_features WHERE river=? AND post=? AND water_level_cm IS NOT NULL ORDER BY date', conn, params=(river,post))
+    finally:
+        conn.close()
+    if df.empty or len(df) < train_window+30:
+        return {'ok': False, 'error': f'Not enough data: {len(df)}'}
+    df=df.sort_values('date').tail(train_window+recent_window)
+    if len(df) < train_window+recent_window:
+        recent_window=len(df)//3
+        train_window=len(df)-recent_window
+    train=df.head(train_window)
+    recent=df.tail(recent_window)
+    cols=['water_level_cm','temp_mean','precip_mm','snow_pct_norm']
+    per=[]
+    mx=0.0
+    worst=None
+    for c in cols:
+        a=train[c].dropna().values
+        b=recent[c].dropna().values
+        if len(a)<20 or len(b)<20: continue
+        stat,pval=ks_2samp(a,b)
+        label=FEATURE_LABELS_RU.get(c,c)
+        flag=float(pval)<0.01 or float(stat)>0.25
+        per.append({'feature':label,'key':c,'ks':round(float(stat),4),'p_value':round(float(pval),6),'flag':flag})
+        if float(stat)>mx:
+            mx=float(stat); worst=label
+    drift=mx>0.25 or any(x['flag'] for x in per)
+    return {'ok':True,'river':river,'post':post,'train_window':train_window,'recent_window':recent_window,'n_train':len(train),'n_recent':len(recent),'drift_detected':drift,'max_ks':round(mx,4),'worst_feature':worst,'per_feature':per,'note':'KS>0.25 or p<0.01 -> drift' if drift else 'No drift'}
+
+
+def compute_reliability(river: str, post: str, horizon: int = 7, level: str = 'low', n_bins: int = 10, min_samples: int = 50) -> dict:
+    import pandas as pd
+    import numpy as np
+    predictor=load_predictor(river, post)
+    if not predictor:
+        return {'ok': False, 'error': 'Model not trained'}
+    st=get_station_row(river, post)
+    if not st:
+        return {'ok': False, 'error': 'Station not found'}
+    thr=float(st.get('low_oya') if level=='low' else st.get('critical_oya') or 650)
+    conn=get_db()
+    try:
+        df=pd.read_sql_query('SELECT date, water_level_cm FROM daily_features WHERE river=? AND post=? AND water_level_cm IS NOT NULL ORDER BY date', conn, params=(river,post))
+    finally:
+        conn.close()
+    if len(df) < min_samples + horizon + 10:
+        return {'ok': False, 'error': f'Not enough data: {len(df)}'}
+    df['date']=pd.to_datetime(df['date'])
+    df=df.sort_values('date')
+    raw=[]
+    y_true=[]
+    for idx in range(len(df)-horizon):
+        base=df.iloc[idx]['date'].date()
+        try:
+            res=predictor.predict(base, horizon=horizon, warning_level=thr, danger_level=thr)
+        except Exception:
+            continue
+        if not res: continue
+        key='prob_warning' if level=='low' else 'prob_danger'
+        pr=res.get(key)
+        if pr is None: continue
+        y=1 if float(df.iloc[idx+horizon]['water_level_cm']) >= thr else 0
+        raw.append(float(pr))
+        y_true.append(y)
+    if len(raw) < min_samples:
+        return {'ok': False, 'error': f'Only {len(raw)} points'}
+    X=np.array(raw)
+    y=np.array(y_true, dtype=float)
+    cal=np.array([apply_isotonic_calibration(float(p), river, post, horizon, level) for p in X])
+    def bins(probs):
+        edges=np.linspace(0,1,n_bins+1)
+        centers=[]; frac=[]; cnt=[]
+        for i in range(n_bins):
+            m=(probs>=edges[i]) & (probs < edges[i+1] if i < n_bins-1 else probs <= edges[i+1])
+            c=int(m.sum())
+            centers.append(float((edges[i]+edges[i+1])/2))
+            frac.append(float(y[m].mean()) if c else 0.0)
+            cnt.append(c)
+        return centers, frac, cnt
+    centers, frac_raw, cnt_raw = bins(X)
+    _, frac_cal, cnt_cal = bins(cal)
+    def brier(a,b): return float(np.mean((a-b)**2))
+    ece=0.0
+    for i in range(n_bins):
+        if cnt_raw[i]==0: continue
+        ece += (cnt_raw[i]/len(X)) * abs(float(centers[i])-float(frac_raw[i]))
+    return {'ok': True,'river':river,'post':post,'horizon':horizon,'level':level,'threshold':thr,'n':len(X),'n_bins':n_bins,'centers':[round(x,3) for x in centers],'frac_raw':[round(x,3) for x in frac_raw],'frac_cal':[round(x,3) for x in frac_cal],'counts_raw':cnt_raw,'counts_cal':cnt_cal,'brier_raw':round(brier(X,y),4),'brier_cal':round(brier(cal,y),4),'ece_raw':round(float(ece),4),'positive_rate':round(float(y.mean()),4)}
+
 def get_station_model_status(river: str, post: str) -> dict:
     has_model = has_trained_model(river, post)
     horizons = get_model_horizons(river, post) if has_model else []
@@ -1487,4 +1655,167 @@ def get_station_model_status(river: str, post: str) -> dict:
         "available_years": years,
         "last_training": last_train,
         "supports_medium": has_model and any(h >= 14 for h in horizons),
+        "coverage": get_data_coverage(river, post),
     }
+
+# ---------------------------------------------------------------------------
+# Калибровка p_exceed методом изотонической регрессии
+# ---------------------------------------------------------------------------
+_CALIBRATORS: dict = {}
+
+def _calibrator_path(river: str, post: str, horizon: int, level: str) -> Path:
+    safe_r = river.replace(" ", "_").replace("/", "_")
+    safe_p = post.replace(" ", "_").replace("/", "_")
+    return MODELS_DIR / safe_r / safe_p / f"isotonic_h{horizon}_{level}.joblib"
+
+def fit_isotonic_calibrator(river: str, post: str, horizon: int = 7, level: str = "low", min_samples: int = 50) -> dict:
+    """Обучает IsotonicRegression на исторических прогнозах vs факте."""
+    import pandas as pd
+    import numpy as np
+    try:
+        from sklearn.isotonic import IsotonicRegression
+    except ImportError:
+        return {"ok": False, "error": "scikit-learn не установлен (нужен IsotonicRegression)"}
+    predictor = load_predictor(river, post)
+    if not predictor:
+        return {"ok": False, "error": "Модель не обучена для станции"}
+    st = get_station_row(river, post)
+    if not st:
+        return {"ok": False, "error": "Станция не найдена"}
+    thr = float(st.get("low_oya") if level == "low" else st.get("critical_oya") or 650)
+    conn = get_db()
+    try:
+        df = pd.read_sql_query(
+            "SELECT date, water_level_cm FROM daily_features WHERE river=? AND post=? AND water_level_cm IS NOT NULL ORDER BY date",
+            conn, params=(river, post),
+        )
+    finally:
+        conn.close()
+    if len(df) < min_samples + horizon + 10:
+        return {"ok": False, "error": f"Недостаточно данных: {len(df)} < {min_samples + horizon}"}
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    raw_probs = []
+    y_true = []
+    for idx in range(len(df) - horizon):
+        base_date = df.iloc[idx]["date"].date()
+        try:
+            res = predictor.predict(base_date, horizon=horizon, warning_level=thr, danger_level=thr)
+        except Exception:
+            continue
+        if not res:
+            continue
+        key = "prob_warning" if level == "low" else "prob_danger"
+        p = res.get(key)
+        if p is None:
+            continue
+        actual_level = float(df.iloc[idx + horizon]["water_level_cm"])
+        y = 1 if actual_level >= thr else 0
+        raw_probs.append(float(p))
+        y_true.append(y)
+    if len(raw_probs) < min_samples:
+        return {"ok": False, "error": f"Собрано лишь {len(raw_probs)} точек (нужно {min_samples})"}
+    X = np.array(raw_probs)
+    y = np.array(y_true, dtype=float)
+    order = np.argsort(X)
+    Xs, ys = X[order], y[order]
+    ir = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    try:
+        ir.fit(Xs, ys)
+    except Exception as e:
+        return {"ok": False, "error": f"Isotonic fit error: {e}"}
+    path = _calibrator_path(river, post, horizon, level)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import joblib
+        joblib.dump(ir, path)
+        _CALIBRATORS[(river, post, horizon, level)] = ir
+    except Exception:
+        pass
+    cal = ir.predict(X)
+    def brier(a, b): return float(np.mean((a - b) ** 2))
+    return {
+        "ok": True,
+        "river": river, "post": post, "horizon": horizon, "level": level,
+        "threshold": thr,
+        "n_samples": len(raw_probs),
+        "brier_raw": round(brier(X, y), 4),
+        "brier_cal": round(brier(cal, y), 4),
+        "path": path.relative_to(PROJECT_ROOT).as_posix() if path.exists() else str(path),
+    }
+
+def apply_isotonic_calibration(raw_prob: float, river: str, post: str, horizon: int = 7, level: str = "low") -> float:
+    key = (river, post, horizon, level)
+    ir = _CALIBRATORS.get(key)
+    if ir is None:
+        path = _calibrator_path(river, post, horizon, level)
+        if path.exists():
+            try:
+                import joblib
+                ir = joblib.load(path)
+                _CALIBRATORS[key] = ir
+            except Exception:
+                return float(raw_prob)
+        else:
+            return float(raw_prob)
+    try:
+        import numpy as np
+        v = float(ir.predict([float(raw_prob)])[0])
+        return round(min(max(v, 0.0), 1.0), 4)
+    except Exception:
+        return float(raw_prob)
+
+def get_shap_explanation(river: str, post: str, horizon: int = 7, quantile: float = 0.5, top_k: int = 10) -> dict:
+    """SHAP через shap.TreeExplainer или fallback на feature_importance."""
+    predictor = load_predictor(river, post)
+    if not predictor:
+        return {"ok": False, "error": "Модель не найдена", "method": "none"}
+    try:
+        imp = predictor.get_feature_importance(horizon=horizon, quantile=quantile)
+        fallback = sorted(imp.items(), key=lambda x: -x[1])[:top_k]
+    except Exception:
+        fallback = []
+    try:
+        import shap  # type: ignore
+        has_shap = True
+    except ImportError:
+        has_shap = False
+    if not has_shap:
+        return {
+            "ok": True,
+            "method": "feature_importance_fallback",
+            "note": "shap не установлен — использован importance. pip install shap",
+            "values": [{"feature": FEATURE_LABELS_RU.get(k, k), "key": k, "value": round(float(v), 4)} for k, v in fallback],
+            "base_value": None,
+        }
+    try:
+        h = horizon if horizon in predictor.models else next(iter(predictor.models))
+        q = quantile if quantile in predictor.models[h] else next(iter(predictor.models[h]))
+        model = predictor.models[h][q]
+        import pandas as pd
+        conn = get_db()
+        try:
+            df_bg = pd.read_sql_query("SELECT * FROM daily_features WHERE river=? AND post=? ORDER BY date DESC LIMIT 50", conn, params=(river, post))
+        finally:
+            conn.close()
+        if df_bg.empty or not predictor.features:
+            return {"ok": True, "method": "feature_importance_fallback", "values": [{"feature": FEATURE_LABELS_RU.get(k, k), "key": k, "value": round(float(v), 4)} for k, v in fallback]}
+        cols = [c for c in predictor.features if c in df_bg.columns]
+        X_bg = df_bg[cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+        X_one = X_bg.iloc[[-1]]
+        explainer = shap.TreeExplainer(model)
+        import numpy as np
+        sv = explainer.shap_values(X_one)
+        arr = np.array(sv).reshape(-1)
+        pairs = sorted(zip(cols, arr.tolist()), key=lambda x: -abs(x[1]))[:top_k]
+        base = None
+        try:
+            ev = explainer.expected_value
+            base = float(ev) if isinstance(ev, (int, float)) else float(np.array(ev).flat[0])
+        except Exception:
+            pass
+        return {"ok": True, "method": "shap.TreeExplainer", "horizon": h, "quantile": q, "base_value": round(base, 3) if base is not None else None, "values": [{"feature": FEATURE_LABELS_RU.get(k, k), "key": k, "value": round(float(v), 4), "abs": round(float(abs(v)), 4)} for k, v in pairs]}
+    except Exception as e:
+        return {"ok": False, "method": "shap_error_fallback", "error": str(e)[:500], "values": [{"feature": FEATURE_LABELS_RU.get(k, k), "key": k, "value": round(float(v), 4)} for k, v in fallback]}
+
+

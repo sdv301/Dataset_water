@@ -23,11 +23,13 @@ import { AgentAlertsBadge } from './components/AgentAlertsBadge';
 import { ScenarioRoom } from './components/ScenarioRoom';
 import { BacktestPanel } from './components/BacktestPanel';
 import { AnalogPanel } from './components/AnalogPanel';
+import { AgentSettingsPanel } from './components/AgentSettingsPanel';
+import { QualityPanel } from './components/QualityPanel';
 import { notifyTrainingFinished, requestTrainingNotifications } from './utils/trainingNotify';
 import { API_BASE, MAP_SATELLITE_TILES_URL, MAP_SCHEME_TILES_URL } from './config';
 
 // --- Types & API ---
-type ForecastMode = 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data' | 'scenario';
+type ForecastMode = 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data' | 'scenario' | 'agent';
 type WidgetId = 'cross_model' | 'scatter' | 'basin_risk' | 'feature_importance' | 'heatmap' | 'risk_pie' | 'peak_analysis';
 
 interface StationInfo {
@@ -137,14 +139,8 @@ function getRiverBounds(riverStations: StationInfo[]): { center: [number, number
   return { center: [lat, lng], zoom };
 }
 
-const DEFAULT_STATIONS: StationInfo[] = [
-  { label: 'Лена — Якутск', river: 'Лена', post: 'Якутск', lat: 62.0, lng: 129.7, risk: 'low', critical_oya: 827, low_oya: -115 },
-  { label: 'Лена — Ленск', river: 'Лена', post: 'Ленск', lat: 60.72, lng: 114.95, risk: 'medium', critical_oya: 1760, low_oya: 75 },
-  { label: 'Алдан — Томмот', river: 'Алдан', post: 'Томмот', lat: 58.96, lng: 126.28, risk: 'low', critical_oya: 820 },
-  { label: 'Вилюй — Вилюйск', river: 'Вилюй', post: 'Вилюйск', lat: 63.75, lng: 121.63, risk: 'low', critical_oya: 1050, low_oya: 110 },
-  { label: 'Колыма — Черский', river: 'Колыма', post: 'Черский', lat: 68.75, lng: 161.33, risk: 'low', critical_oya: 600 },
-  { label: 'Амга — Амга', river: 'Амга', post: 'Амга', lat: 60.90, lng: 131.98, risk: 'low', critical_oya: 925 },
-];
+// Станции загружаются только из API /api/rivers + /api/rivers/{river}/posts (БД). Хардкода нет.
+const FALLBACK_STATION_HINT: StationInfo | null = null;
 
 // --- MapLibre raster style builder (Task 7) ---
 function buildRasterStyle(
@@ -198,11 +194,11 @@ const SCHEME_STYLE = buildRasterStyle(
 export default function App() {
   const [mode, setMode] = useState<ForecastMode>('short');
   const [activeWidgets, setActiveWidgets] = useState<WidgetId[]>(['peak_analysis', 'cross_model', 'scatter', 'basin_risk']);
-  const [stations, setStations] = useState<StationInfo[]>(DEFAULT_STATIONS);
-  const [station, setStation] = useState(DEFAULT_STATIONS[0].label);
-  const [warningLevel, setWarningLevel] = useState(827);
-  const [dangerLevel, setDangerLevel] = useState(1000);
-  const [minLevel, setMinLevel] = useState(DEFAULT_STATIONS[0].low_oya ?? 0);
+  const [stations, setStations] = useState<StationInfo[]>([]);
+  const [station, setStation] = useState('');
+  const [warningLevel, setWarningLevel] = useState(0);
+  const [dangerLevel, setDangerLevel] = useState(0);
+  const [minLevel, setMinLevel] = useState(0);
   const [apiConnected, setApiConnected] = useState(false);
   const [dbReady, setDbReady] = useState(false);
   const [dbError, setDbError] = useState<string | null>(null);
@@ -244,6 +240,8 @@ export default function App() {
   const [priorityItems, setPriorityItems] = useState<any[]>([]);
   const [historyOnlyCurrent, setHistoryOnlyCurrent] = useState(false);
   const [authRole, setAuthRole] = useState<string>('admin');
+  const [calibrating, setCalibrating] = useState(false);
+  const [calibrateMsg, setCalibrateMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   
   // What If scenarios
   const [tempMod, setTempMod] = useState(0);
@@ -364,7 +362,7 @@ export default function App() {
       .catch(() => setTrainingHistory([]));
   }, []);
 
-  const currentStation = stations.find(s => s.label === station) || stations[0];
+  const currentStation: StationInfo | undefined = stations.find(s => s.label === station) ?? stations[0] ?? undefined;
 
   const fetchDataStats = useCallback(() => {
     fetch(`${API_BASE}/data/stats`)
@@ -755,6 +753,7 @@ export default function App() {
                 { id: 'norm', label: 'Норма', icon: BarChart2 },
                 { id: 'dashboards', label: 'Дашборды', icon: LayoutDashboard },
                 { id: 'scenario', label: 'Комната сценариев', icon: Settings2 },
+                { id: 'agent', label: 'Агент (админ)', icon: AlertOctagon },
                 { id: 'data', label: 'Управление данными', icon: Database },
               ].map((item) => (
                 <button
@@ -817,13 +816,53 @@ export default function App() {
                     {modelStatus.last_training.finished_at ? ` (${modelStatus.last_training.finished_at.slice(0, 10)})` : ''}
                   </p>
                 )}
-                <button
-                  type="button"
-                  onClick={fetchModelStatus}
-                  className="text-blue-600 hover:underline mt-1"
-                >
-                  Проверить модель
-                </button>
+                <div className="flex flex-wrap gap-2 mt-1.5">
+                  <button
+                    type="button"
+                    onClick={fetchModelStatus}
+                    className="text-blue-600 hover:underline"
+                  >
+                    Проверить модель
+                  </button>
+                  {authRole === 'admin' && modelStatus.has_model && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!currentStation || calibrating) return;
+                        setCalibrating(true);
+                        setCalibrateMsg(null);
+                        try {
+                          const encR = encodeURIComponent(currentStation.river);
+                          const encP = encodeURIComponent(currentStation.post);
+                          const r = await fetch(
+                            `${API_BASE}/calibrate/${encR}/${encP}?horizon=all&level=both`,
+                            { method: 'POST' },
+                          );
+                          const body = await r.json().catch(() => ({}));
+                          if (!r.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `HTTP ${r.status}`);
+                          setCalibrateMsg({
+                            kind: 'ok',
+                            text: `Откалибровано ${body.trained ?? 0} из ${body.total ?? 0} (горизонты × НЯ/ОЯ).`,
+                          });
+                        } catch (e: any) {
+                          setCalibrateMsg({ kind: 'err', text: `Калибровка: ${e.message || e}` });
+                        } finally {
+                          setCalibrating(false);
+                        }
+                      }}
+                      disabled={calibrating}
+                      className="text-purple-600 hover:underline disabled:opacity-60 disabled:cursor-not-allowed"
+                      title="Обучить изотоническую калибровку P(превышение) для всех обученных горизонтов, уровни НЯ и ОЯ"
+                    >
+                      {calibrating ? 'Калибрую…' : 'Калибровать все горизонты'}
+                    </button>
+                  )}
+                </div>
+                {calibrateMsg && (
+                  <p className={`text-[10px] mt-1 ${calibrateMsg.kind === 'ok' ? 'text-emerald-700' : 'text-red-700'}`}>
+                    {calibrateMsg.text}
+                  </p>
+                )}
               </div>
             ) : (
               <p className="text-[11px] mt-1.5 text-slate-500">Загрузка статуса модели…</p>
@@ -865,92 +904,13 @@ export default function App() {
             )}
           </div>
 
-          <div className="space-y-4">
-            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center justify-between">
-              Критические уровни
-              <AlertTriangle className="w-4 h-4 text-orange-400" />
-            </label>
-            <div className="space-y-3">
-              <div>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-600">Повышенный (НЯ)</span>
-                  <span className="font-mono text-orange-600">{warningLevel} см</span>
-                </div>
-                <input 
-                  type="range" min="300" max="800" step="10" 
-                  value={warningLevel} onChange={(e) => setWarningLevel(Number(e.target.value))}
-                  className="w-full accent-orange-500"
-                />
-              </div>
-              <div>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-600">Опасный (ОЯ)</span>
-                  <span className="font-mono text-red-600">{dangerLevel} см</span>
-                </div>
-                <input 
-                  type="range" min="400" max="1000" step="10" 
-                  value={dangerLevel} onChange={(e) => setDangerLevel(Number(e.target.value))}
-                  className="w-full accent-red-600"
-                />
-              </div>
-              <div>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-600">Минимальный (низкий ОЯ)</span>
-                  <span className="font-mono text-blue-600">{minLevel} см</span>
-                </div>
-                <input 
-                  type="range" min={-300} max={2000} step="10" 
-                  value={minLevel} onChange={(e) => setMinLevel(Number(e.target.value))}
-                  className="w-full accent-blue-500"
-                />
-              </div>
+          {currentStation && (
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1">
+              <p className="text-xs font-semibold text-slate-600">Пороги поста</p>
+              <p className="text-xs text-slate-700">НЯ <span className="font-mono font-bold text-orange-600">{warningLevel} см</span> · ОЯ <span className="font-mono font-bold text-red-600">{dangerLevel} см</span></p>
+              <p className="text-[10px] text-slate-400">Берутся из БД stations, меняются в Комнате сценариев. Текущий пост: {currentStation.river} — {currentStation.post}</p>
             </div>
-          </div>
-
-          <div className="space-y-4 pt-4 border-t border-slate-100">
-            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-2">
-              <Settings2 className="w-4 h-4" />
-              Сценарий "Что если"
-            </label>
-            
-            <div className="space-y-4">
-              <div>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-600 flex items-center gap-1"><Thermometer className="w-3 h-3"/> Температура</span>
-                  <span className="font-mono">{tempMod > 0 ? '+' : ''}{tempMod}°C</span>
-                </div>
-                <input 
-                  type="range" min="-5" max="5" step="0.5" 
-                  value={tempMod} onChange={(e) => setTempMod(Number(e.target.value))}
-                  className="w-full accent-blue-500"
-                />
-              </div>
-              
-              <div>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-600 flex items-center gap-1"><CloudRain className="w-3 h-3"/> Осадки</span>
-                  <span className="font-mono">{precipMod}% от нормы</span>
-                </div>
-                <input 
-                  type="range" min="0" max="200" step="10" 
-                  value={precipMod} onChange={(e) => setPrecipMod(Number(e.target.value))}
-                  className="w-full accent-blue-500"
-                />
-              </div>
-
-              <div>
-                <div className="flex justify-between text-xs mb-1">
-                  <span className="text-slate-600 flex items-center gap-1"><Snowflake className="w-3 h-3"/> Снежный покров</span>
-                  <span className="font-mono">{snowMod}%</span>
-                </div>
-                <input 
-                  type="range" min="0" max="200" step="10" 
-                  value={snowMod} onChange={(e) => setSnowMod(Number(e.target.value))}
-                  className="w-full accent-blue-500"
-                />
-              </div>
-            </div>
-          </div>
+          )}
         </div>
       </aside>
 
@@ -1168,8 +1128,8 @@ export default function App() {
                 </div>
                 {currentStation && (
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    <BacktestPanel river={currentRiver} post={currentPost} />
-                    <AnalogPanel river={currentRiver} post={currentPost} />
+                    <BacktestPanel river={currentStation.river} post={currentStation.post} />
+                    <AnalogPanel river={currentStation.river} post={currentStation.post} />
                   </div>
                 )}
                 <div className="flex gap-2">
@@ -1622,6 +1582,7 @@ export default function App() {
                         Спутник
                       </button>
                     </div>
+                    {currentStation && (
                     <button
                       type="button"
                       onClick={() => centerOnRiver(currentStation.river)}
@@ -1630,6 +1591,7 @@ export default function App() {
                       <Crosshair className="w-3.5 h-3.5 text-blue-500" />
                       Центрировать: {currentStation.river}
                     </button>
+                    )}
                   </div>
                 </div>
                 <div className="h-[400px] w-full rounded-xl overflow-hidden border border-slate-200 z-0 relative bg-slate-900">
@@ -1701,8 +1663,8 @@ export default function App() {
             {mode === 'scenario' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
                 <p className="text-sm text-slate-600 bg-slate-50 border border-slate-200 rounded-xl px-4 py-3">
-                  Сценарии «что если» — 5 траекторий на 30 дней от базы {scenarioPayload?.base_date ? formatDateRu(scenarioPayload.base_date) : tierPayload?.base_date ? formatDateRu(tierPayload.base_date) : '—'}.
-                  Левый ползунок меняет «Ваш сценарий» (зелёная линия). Строгий вердикт затопления в агенте: <code className="bg-white border px-1 rounded">P(q90 ≥ НЯ) ≥ 0.7</code>.
+                  Сценарии «что если» — траектории на 30 дней от базы {scenarioPayload?.base_date ? formatDateRu(scenarioPayload.base_date) : tierPayload?.base_date ? formatDateRu(tierPayload.base_date) : '—'}.
+                  Строгий вердикт затопления в агенте: <code className="bg-white border px-1 rounded">P(q90 ≥ НЯ) ≥ 0.7</code>.
                   {!scenarioPayload?.has_model && ' Показан демо-прогноз — обучите модель станции.'}
                 </p>
                 <ScenarioRoom
@@ -1713,8 +1675,20 @@ export default function App() {
                   low={warningLevel}
                   crit={dangerLevel}
                   onThresholdChange={(low, crit) => { setWarningLevel(low); setDangerLevel(crit); }}
+                  tempDelta={tempMod}
+                  precipPct={precipMod}
+                  snowPct={snowMod}
+                  onScenarioParamsChange={({temp_delta, precip_pct, snow_pct})=>{ setTempMod(temp_delta); setPrecipMod(precip_pct); setSnowMod(snow_pct); }}
                 />
               </div>
+            )}
+
+            {mode === 'agent' && (
+              authRole !== 'admin' ? (
+                <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-6 text-sm text-amber-900">Доступ только для роли admin. Текущая роль: {authRole || '—'}.</div>
+              ) : (
+                <AgentSettingsPanel />
+              )
             )}
 
             {mode === 'data' && (
@@ -1983,6 +1957,9 @@ export default function App() {
                     </table>
                   </div>
                 </div>
+                {currentStation && (
+                  <QualityPanel river={currentStation.river} post={currentStation.post} horizon={mode === 'medium' ? 14 : 7} />
+                )}
               </div>
             )}
 
