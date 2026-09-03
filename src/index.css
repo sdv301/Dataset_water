@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+.maplibregl-ctrl-attrib,
+.maplibregl-ctrl-attrib-inner {
+  display: none !important;
+}
+
 /* Локальные SVG-иконки: явный размер и отображение без внешних шрифтов/CDN */
 svg[aria-hidden] {
   display: inline-block;

@@ -6,8 +6,5 @@ export const API_BASE = trimSlash(
     || (import.meta.env.DEV ? '/api' : '/flood/v2/api'),
 );
 
-/** Спутник Esri World Imagery через same-origin API (сервер → arcgisonline.com) */
-export const MAP_SATELLITE_TILES_URL = `${API_BASE}/tiles/arcgis/{z}/{y}/{x}`;
-
-/** Схема Carto через API-прокси (без прямого доступа к fastly из браузера) */
-export const MAP_SCHEME_TILES_URL = `${API_BASE}/tiles/carto/{z}/{x}/{y}`;
+/** Офлайн-спутник Якутии (map-tiles), без внешних CDN */
+export const MAP_SATELLITE_TILES_URL = '/maps/tiles/satellite/{z}/{x}/{y}';

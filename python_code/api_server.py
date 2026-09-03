@@ -1065,6 +1065,9 @@ def _write_cached_tile(provider: str, z: int, x: int, y: int, data: bytes, ct: s
         logger.warning("Tile cache write failed %s/%s/%s/%s: %s", provider, z, x, y, exc)
 
 
+_MAP_TILES_URL = os.environ.get("MAP_TILES_URL", "http://map-tiles:8080").rstrip("/")
+
+
 def _fetch_tile_upstream(url: str) -> tuple[bytes, str]:
     req = urllib.request.Request(url, headers={"User-Agent": "hydropredict/tile-proxy"})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1075,54 +1078,24 @@ def _fetch_tile_upstream(url: str) -> tuple[bytes, str]:
 
 @app.get("/api/tiles/arcgis/{z}/{y}/{x}")
 async def arcgis_tile(z: int, y: int, x: int):
-    """Esri World Imagery — © Esri, Maxar, Earthstar Geographics."""
+    """Офлайн-спутник Якутии (map-tiles). Путь ArcGIS z/y/x."""
     if z < 0 or z > 22:
         raise HTTPException(status_code=400, detail="Invalid zoom level")
     extent = 2 ** z
     if x < 0 or x >= extent or y < 0 or y >= extent:
         raise HTTPException(status_code=400, detail="Tile out of range")
-    cached = _read_cached_tile("arcgis", z, x, y)
-    if cached:
-        data, ct = cached
-        return Response(content=data, media_type=ct, headers={"Cache-Control": "public, max-age=86400"})
-    url = (
-        f"https://server.arcgisonline.com/ArcGIS/rest/services/"
-        f"World_Imagery/MapServer/tile/{z}/{y}/{x}"
-    )
+    url = f"{_MAP_TILES_URL}/tiles/satellite/{z}/{x}/{y}"
     try:
         data, ct = _fetch_tile_upstream(url)
-        _write_cached_tile("arcgis", z, x, y, data, ct)
         return Response(content=data, media_type=ct, headers={"Cache-Control": "public, max-age=86400"})
     except Exception as exc:
-        # Fallback: serve stale cache if upstream fails
-        stale = _read_cached_tile("arcgis", z, x, y)
-        if stale:
-            return Response(content=stale[0], media_type=stale[1], headers={"Cache-Control": "public, max-age=86400"})
-        raise HTTPException(status_code=502, detail=f"ArcGIS tile fetch failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Satellite tile fetch failed: {exc}") from exc
 
 
 @app.get("/api/tiles/carto/{z}/{x}/{y}")
 async def carto_tile(z: int, x: int, y: int):
-    """Carto Positron light scheme tiles (proxied)."""
-    if z < 0 or z > 22:
-        raise HTTPException(status_code=400, detail="Invalid zoom level")
-    extent = 2 ** z
-    if x < 0 or x >= extent or y < 0 or y >= extent:
-        raise HTTPException(status_code=400, detail="Tile out of range")
-    cached = _read_cached_tile("carto", z, x, y)
-    if cached:
-        data, ct = cached
-        return Response(content=data, media_type=ct, headers={"Cache-Control": "public, max-age=86400"})
-    url = f"https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png"
-    try:
-        data, ct = _fetch_tile_upstream(url)
-        _write_cached_tile("carto", z, x, y, data, ct or "image/png")
-        return Response(content=data, media_type=ct or "image/png", headers={"Cache-Control": "public, max-age=86400"})
-    except Exception as exc:
-        stale = _read_cached_tile("carto", z, x, y)
-        if stale:
-            return Response(content=stale[0], media_type=stale[1], headers={"Cache-Control": "public, max-age=86400"})
-        raise HTTPException(status_code=502, detail=f"Carto tile fetch failed: {exc}") from exc
+    """Совместимость: схема тоже отдаёт офлайн-спутник."""
+    return await arcgis_tile(z, y, x)
 
 
 @app.get("/")

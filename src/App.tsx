@@ -26,7 +26,7 @@ import { AnalogPanel } from './components/AnalogPanel';
 import { AgentSettingsPanel } from './components/AgentSettingsPanel';
 import { QualityPanel } from './components/QualityPanel';
 import { notifyTrainingFinished, requestTrainingNotifications } from './utils/trainingNotify';
-import { API_BASE, MAP_SATELLITE_TILES_URL, MAP_SCHEME_TILES_URL } from './config';
+import { API_BASE, MAP_SATELLITE_TILES_URL } from './config';
 
 // --- Types & API ---
 type ForecastMode = 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data' | 'scenario' | 'agent';
@@ -147,20 +147,17 @@ function buildRasterStyle(
   name: string,
   sourceId: string,
   tilesUrl: string,
-  attribution: string,
   maxzoom = 19,
 ) {
   return {
     version: 8 as const,
     name,
-    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
     sources: {
       [sourceId]: {
         type: 'raster' as const,
         tiles: [tilesUrl],
         tileSize: 256,
         maxzoom,
-        attribution,
       },
     },
     layers: [
@@ -178,17 +175,8 @@ function buildRasterStyle(
 const SATELLITE_STYLE = buildRasterStyle(
   'Satellite',
   'satellite-tiles',
-  MAP_SATELLITE_TILES_URL.replace('{z}', '{z}').replace('{y}', '{y}').replace('{x}', '{x}'),
-  '© Esri, Maxar, Earthstar Geographics',
+  MAP_SATELLITE_TILES_URL,
   18,
-);
-
-const SCHEME_STYLE = buildRasterStyle(
-  'Scheme',
-  'scheme-tiles',
-  MAP_SCHEME_TILES_URL.replace('{z}', '{z}').replace('{x}', '{x}').replace('{y}', '{y}'),
-  '© CARTO, © OpenStreetMap contributors',
-  19,
 );
 
 export default function App() {
@@ -248,7 +236,7 @@ export default function App() {
   const [precipMod, setPrecipMod] = useState(100);
   const [snowMod, setSnowMod] = useState(100);
   
-  const [mapStyle, setMapStyle] = useState<'scheme' | 'satellite'>('satellite');
+  const [mapStyle] = useState<'scheme' | 'satellite'>('satellite');
   const [mapData, setMapData] = useState<'risk' | 'temp' | 'snow'>('risk');
   const [mapCenter, setMapCenter] = useState<[number, number]>([63, 130]);
   const [mapZoom, setMapZoom] = useState(4);
@@ -1568,20 +1556,6 @@ export default function App() {
                       <option value="temp">Температурный фон</option>
                       <option value="snow">Снегозапасы</option>
                     </select>
-                    <div className="flex bg-slate-100 rounded-lg p-0.5">
-                      <button 
-                        onClick={() => setMapStyle('scheme')}
-                        className={`text-xs px-3 py-1.5 rounded-md font-medium transition-colors ${mapStyle === 'scheme' ? 'bg-white shadow-sm text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
-                      >
-                        Схема
-                      </button>
-                      <button 
-                        onClick={() => setMapStyle('satellite')}
-                        className={`text-xs px-3 py-1.5 rounded-md font-medium transition-colors ${mapStyle === 'satellite' ? 'bg-white shadow-sm text-slate-800' : 'text-slate-500 hover:text-slate-700'}`}
-                      >
-                        Спутник
-                      </button>
-                    </div>
                     {currentStation && (
                     <button
                       type="button"
@@ -1599,7 +1573,7 @@ export default function App() {
                     longitude={mapCenter[1]}
                     latitude={mapCenter[0]}
                     zoom={mapZoom}
-                    mapStyle={mapStyle === 'satellite' ? SATELLITE_STYLE : SCHEME_STYLE}
+                    mapStyle={SATELLITE_STYLE}
                     onMove={(e: ViewStateChangeEvent) => {
                       const { latitude, longitude, zoom } = e.viewState;
                       setMapCenter([latitude, longitude]);
@@ -1651,11 +1625,6 @@ export default function App() {
                       );
                     })}
                   </MapGL>
-                  <div className="absolute bottom-2 left-2 right-2 text-[10px] text-white/90 bg-black/40 px-2 py-1 rounded pointer-events-none">
-                    {mapStyle === 'satellite'
-                      ? '© Esri, Maxar, Earthstar Geographics'
-                      : '© CARTO, © OpenStreetMap contributors'}
-                  </div>
                 </div>
               </div>
             )}
