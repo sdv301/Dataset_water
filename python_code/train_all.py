@@ -197,26 +197,10 @@ def train_station(
     except Exception as e:
         print(f"  [!] Ошибка оценки: {e}")
 
-    # Регистрация в реестре
-    registry = ModelRegistry(models_dir=models_dir)
-    train_metrics = predictor.get_metrics()
-
-    for h, q_dict in train_metrics.items():
-        for q, m in q_dict.items():
-            if h in predictor.models and q in predictor.models[h]:
-                registry.register_model(
-                    river=river,
-                    post=post,
-                    horizon=h,
-                    quantile=q,
-                    model=predictor.models[h][q],
-                    metrics={
-                        "rmse": m["rmse"],
-                        "mae": m["mae"],
-                        "pinball_loss": m["pinball_loss"],
-                    },
-                    params=m.get("params", {}),
-                )
+    # predictor.train() уже сохранил модели (model_h*_q*.joblib) + manifest.json в схеме
+    # FloodPredictor (horizons/quantiles/features/metrics). ModelRegistry.register_model
+    # НЕ вызывается: его схема manifest ("models") несовместима с рабочим manifest и
+    # перезаписала бы его, ломая load_models(). Метаданные в БД — register_station_model ниже.
 
     reg = hs.register_station_model(river, post)
     if reg:

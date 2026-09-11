@@ -237,7 +237,9 @@ export default function App() {
   const [snowMod, setSnowMod] = useState(100);
   
   const [mapStyle] = useState<'scheme' | 'satellite'>('satellite');
-  const [mapData, setMapData] = useState<'risk' | 'temp' | 'snow'>('risk');
+  const [mapData, setMapData] = useState<'risk'>('risk');
+  // Карта безопасности: риск/вердикт по постам из agent_snapshots (/api/map/latest)
+  const [mapRisk, setMapRisk] = useState<Record<string, any>>({});
   const [mapCenter, setMapCenter] = useState<[number, number]>([63, 130]);
   const [mapZoom, setMapZoom] = useState(4);
 
@@ -699,6 +701,22 @@ export default function App() {
     
     return { historyMapped: histMap, forecastMapped: foreMap, forecastData: [...histMap, ...foreMap] };
   }, [apiForecast, apiHistory, tempMod, precipMod, targetDate, mode]);
+
+  // Карта безопасности: загрузка snapshot-риска из /api/map/latest (без ML на клиенте).
+  // Запускается, когда станции загрузились (length 0→N), и обновляет mapRisk по постам.
+  useEffect(() => {
+    let alive = true;
+    fetch(`${API_BASE}/map/latest`)
+      .then((r) => (r.ok ? r.json() : Promise.resolve(null)))
+      .then((data: any) => {
+        if (!alive || !data || !Array.isArray(data.points)) return;
+        const byKey: Record<string, any> = {};
+        for (const p of data.points) byKey[`${p.river}|${p.post}`] = p;
+        setMapRisk(byKey);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [stations.length]);
 
   const maxQ95 = forecastMapped.length > 0 ? Math.max(...forecastMapped.map(d => d.q95)) : 0;
   const minForecastMedian = forecastMapped.length > 0
@@ -1552,9 +1570,7 @@ export default function App() {
                       onChange={(e) => setMapData(e.target.value as any)}
                       className="text-xs border border-slate-200 rounded-lg px-2 py-1.5 outline-none text-slate-700 bg-slate-50 font-medium cursor-pointer"
                     >
-                      <option value="risk">Уровень риска</option>
-                      <option value="temp">Температурный фон</option>
-                      <option value="snow">Снегозапасы</option>
+                      <option value="risk">Карта безопасности (риск)</option>
                     </select>
                     {currentStation && (
                     <button
@@ -1586,21 +1602,15 @@ export default function App() {
                       let dataValue = '';
                       let labelObj = '';
                       
-                      if (mapData === 'risk') {
-                        fillColor = s.risk === 'high' ? '#ef4444' : s.risk === 'medium' ? '#f97316' : '#10b981';
-                        dataValue = s.risk === 'high' ? 'Критическая (ОЯ)' : s.risk === 'medium' ? 'Повышенная (НЯ)' : 'Низкая (Норма)';
-                        labelObj = 'Опасность:';
-                      } else if (mapData === 'temp') {
-                        const temp = s.lat > 60 ? -5 + tempMod : 12 + tempMod;
-                        fillColor = temp > 0 ? '#ef4444' : '#3b82f6';
-                        dataValue = `${temp.toFixed(1)}°C`;
-                        labelObj = 'Средняя T°:';
-                      } else if (mapData === 'snow') {
-                        const snow = Math.round((s.lat > 60 ? 120 : 15) * (snowMod / 100));
-                        fillColor = snow > 50 ? '#0891b2' : '#38bdf8';
-                        dataValue = `${snow} см`;
-                        labelObj = 'Снежный покров:';
-                      }
+                      // Карта безопасности: цвет/подпись по risk_class из agent_snapshots (/api/map/latest).
+                      // Фейковые температурный/снежный режимы удалены — реальных наблюдений на карте нет.
+                      const mr = mapRisk[`${s.river}|${s.post}`];
+                      const rk = mr?.risk_class || s.risk || 'low';
+                      fillColor = (rk === 'critical' || rk === 'high') ? '#ef4444'
+                        : (rk === 'medium' || rk === 'moderate') ? '#f97316' : '#10b981';
+                      dataValue = (rk === 'critical' || rk === 'high') ? 'Критическая (ОЯ)'
+                        : (rk === 'medium' || rk === 'moderate') ? 'Повышенная (НЯ)' : 'Низкая (норма)';
+                      labelObj = 'Риск:';
 
                       const markColor = mapStyle === 'satellite' ? 'rgba(255,255,255,0.8)' : 'white';
                       const isSelected = s.label === station;
@@ -1619,6 +1629,17 @@ export default function App() {
                             <div className="absolute top-1/2 left-full ml-3 -translate-y-1/2 bg-white px-3 py-2 rounded-lg shadow-xl border border-slate-200 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 whitespace-nowrap">
                               <div className="text-sm font-semibold text-slate-800">{s.label}</div>
                               <div className="text-xs text-slate-600 mt-1">{labelObj} <strong>{dataValue}</strong></div>
+                              {mr?.verdict && (
+                                <div className="text-xs text-slate-500 mt-0.5">
+                                  Вердикт: {mr.verdict.level_ru || mr.verdict.level || '—'}
+                                  {mr.verdict.confidence != null ? ` · ${Math.round((mr.verdict.confidence || 0) * 100)}%` : ''}
+                                </div>
+                              )}
+                              {mr?.forecast_peak?.level_cm != null && (
+                                <div className="text-xs text-slate-500 mt-0.5">
+                                  Пик: {mr.forecast_peak.level_cm} см{mr.forecast_peak.date ? ` @ ${mr.forecast_peak.date}` : ''}
+                                </div>
+                              )}
                             </div>
                           </div>
                         </Marker>

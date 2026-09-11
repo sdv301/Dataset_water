@@ -381,28 +381,83 @@ def _last_year_ice_breakup(river: str, post: str, current_year: int) -> Optional
     return None
 
 
+def _clim_prob(med, q90, q95, threshold):
+    """Грубая вероятность превышения порога по климатологии (без ML)."""
+    if threshold is None or med is None:
+        return None
+    if q95 is not None and q95 >= threshold:
+        return 0.5
+    if q90 is not None and q90 >= threshold:
+        return 0.25
+    if med >= threshold:
+        return 0.15
+    return round(0.05 * (med / (threshold + 1e-5)), 3)
+
+
 def _forecast_daily(
     river: str, post: str, horizon: int
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """Полный ряд прогноза (по дням) вместо одной точки-пика.
 
     Возвращает (points, has_model). points — список {date, median, q10, q90,
-    q95, prob_warning, prob_danger}. Если модель не удалось загрузить, вернёт
-    ([], False), а вызывающий код доиграет по климатологии.
+    q95, prob_warning, prob_danger, source}. Прогноз строится ОТ ПОСЛЕДНЕГО
+    наблюдения (base=latest), а не от «сегодня» — это исключает рассинхрон
+    горизонта при устаревших данных и фиксирует silent zero-fill. Если
+    обученной модели нет — честный климатологический fallback (исторические
+    средние/квантили по дню года), has_model=False. Пороги берутся реальные
+    (None, если не заданы) — без фейков 500/650.
     """
     try:
         st = hs.get_station_row(river, post) or {}
-        low = float(st.get("low_oya") or 500)
-        crit = float(st.get("critical_oya") or 650)
+        low = st.get("low_oya")
+        crit = st.get("critical_oya")
+        low_f = float(low) if low is not None else None
+        crit_f = float(crit) if crit is not None else None
         latest = hs.get_latest_data_date(river, post)
-        base = max(latest, datetime.date.today())  # прогноз всегда от сегодня
-        predictor = hs.load_predictor(river, post)
-        if not predictor:
+        if not latest:
             return [], False
-        pts = hs.forecast_points_from_predictor(predictor, base, horizon, low, crit, river=river, post=post) or []
+        base = latest  # прогноз от последнего наблюдения (фикс рассинхрона)
+
+        predictor = hs.load_predictor(river, post)
+        if predictor:
+            pts = hs.forecast_points_from_predictor(
+                predictor, base, horizon, low_f, crit_f, river=river, post=post
+            ) or []
+            for p in pts:
+                p.setdefault("source", "model")
+            return pts, True
+
+        # Нет обученной модели — климатологический fallback.
+        clim = hs.compute_climatology(river, post)
+        if not clim:
+            return [], False
+        clim_map = {c["day_of_year"]: c for c in clim}
+        pts: List[Dict[str, Any]] = []
+        for i in range(horizon):
+            d = base + datetime.timedelta(days=i + 1)
+            c = clim_map.get(d.timetuple().tm_yday)
+            if not c:
+                continue
+            med = c.get("hist_mean")
+            if med is None:
+                continue
+            q10 = c.get("hist_q10")
+            q90 = c.get("hist_q90")
+            q95 = c.get("hist_max")
+            pts.append({
+                "date": d.isoformat(),
+                "median": round(float(med), 2),
+                "q10": round(float(q10), 2) if q10 is not None else round(float(med) * 0.85, 2),
+                "q90": round(float(q90), 2) if q90 is not None else round(float(med) * 1.15, 2),
+                "q95": round(float(q95), 2) if q95 is not None else None,
+                "horizon_used": i + 1,
+                "prob_warning": _clim_prob(med, q90, q95, low_f),
+                "prob_danger": _clim_prob(med, q90, q95, crit_f),
+                "source": "climatology",
+            })
+        return pts, False
     except Exception:
         return [], False
-    return pts, True
 
 
 def _peak_of(points: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[str]]:
@@ -412,8 +467,8 @@ def _peak_of(points: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[st
     return float(peak.get("median") or 0), peak.get("date")
 
 
-def _critical_days(points: List[Dict[str, Any]], low: float, crit: float) -> List[Dict[str, Any]]:
-    """Дни, где прогнозная медиана/верхний квантиль превышает ОЯ."""
+def _critical_days(points: List[Dict[str, Any]], low: Optional[float], crit: Optional[float]) -> List[Dict[str, Any]]:
+    """Дни, где прогнозная медиана/верхний квантиль превышает ОЯ/НЯ."""
     out: List[Dict[str, Any]] = []
     for p in points:
         med = p.get("median")
@@ -422,10 +477,10 @@ def _critical_days(points: List[Dict[str, Any]], low: float, crit: float) -> Lis
             continue
         level = "watch"
         reached = None
-        if med >= crit or (q95 is not None and q95 >= crit):
+        if crit is not None and (med >= crit or (q95 is not None and q95 >= crit)):
             level = "critical"
             reached = "critical_oya"
-        elif med >= low or (q95 is not None and q95 >= low):
+        elif low is not None and (med >= low or (q95 is not None and q95 >= low)):
             level = "warning"
             reached = "low_oya"
         else:
@@ -442,8 +497,8 @@ def _critical_days(points: List[Dict[str, Any]], low: float, crit: float) -> Lis
     return out
 
 
-def _oya_pressure_score(peak: Optional[float], low: float, crit: float) -> float:
-    if peak is None or crit <= 0:
+def _oya_pressure_score(peak: Optional[float], low: Optional[float], crit: Optional[float]) -> float:
+    if peak is None or crit is None or crit <= 0:
         return 0.0
     ratio = peak / crit
     if ratio >= 1.0:
@@ -452,7 +507,7 @@ def _oya_pressure_score(peak: Optional[float], low: float, crit: float) -> float
         return 30.0
     if ratio >= 0.8:
         return 20.0
-    if peak >= low:
+    if low is not None and peak >= low:
         return 10.0
     return 0.0
 
@@ -472,8 +527,8 @@ def assess_flood_risk(
     if not st:
         raise ValueError(f"Станция не найдена: {river} / {post}")
 
-    low = float(st.get("low_oya") or 500)
-    crit = float(st.get("critical_oya") or 650)
+    low = float(st.get("low_oya")) if st.get("low_oya") is not None else None
+    crit = float(st.get("critical_oya")) if st.get("critical_oya") is not None else None
 
     features = _load_recent_features(river, post)
     obs_date = str(features.get("date"))[:10]
@@ -556,44 +611,52 @@ def assess_flood_risk(
     # will_flood = P(q90 ≥ НЯ по горизонту) ≥ 0.7  (строго, без доп. условий по драйверам/prob)
     days_q90_over_low = sum(
         1 for p in forecast_points
-        if (p.get("q90") is not None and p.get("q90") >= low)
+        if low is not None and p.get("q90") is not None and p.get("q90") >= low
     )
     days_q90_over_crit = sum(
         1 for p in forecast_points
-        if (p.get("q90") is not None and p.get("q90") >= crit)
+        if crit is not None and p.get("q90") is not None and p.get("q90") >= crit
     )
     horizon_len = max(1, len(forecast_points))
-    p_exceed_low = days_q90_over_low / horizon_len
-    p_exceed_crit = days_q90_over_crit / horizon_len
+    p_exceed_low = (days_q90_over_low / horizon_len) if low is not None else None
+    p_exceed_crit = (days_q90_over_crit / horizon_len) if crit is not None else None
 
-    # Строгое правило для will_flood (ТЗ): только доля дней где q90 ≥ НЯ
-    will_flood = p_exceed_low >= 0.7
-    # Уровень для UI: red если и ОЯ выполнен на ≥0.7, yellow если только НЯ, иначе green
-    verdict_red = p_exceed_crit >= 0.7
+    # Строгое правило для will_flood (ТЗ): только доля дней где q90 ≥ НЯ.
+    # Если пороги не заданы — честный вердикт «не определён» вместо фейка 500/650.
+    will_flood = (p_exceed_low is not None and p_exceed_low >= 0.7)
+    verdict_red = (p_exceed_crit is not None and p_exceed_crit >= 0.7)
     verdict_yellow = will_flood and not verdict_red
-    verdict_level = "red" if verdict_red else ("yellow" if verdict_yellow else "green")
-    verdict_confidence = round(max(0.0, min(1.0, max(
-        p_exceed_crit,
-        p_exceed_low * 0.9,
-        (prob_dang or 0),
-        (prob_warn or 0) * 0.9,
-    ) - stale_penalty)), 3)
+    verdict_level = ("red" if verdict_red else ("yellow" if verdict_yellow else
+                       ("green" if low is not None else "unknown")))
+    _conf_cands = []
+    if p_exceed_crit is not None:
+        _conf_cands.append(p_exceed_crit)
+    if p_exceed_low is not None:
+        _conf_cands.append(p_exceed_low * 0.9)
+    if prob_dang is not None:
+        _conf_cands.append(prob_dang)
+    if prob_warn is not None:
+        _conf_cands.append((prob_warn or 0) * 0.9)
+    verdict_confidence = round(
+        max(0.0, min(1.0, (max(_conf_cands) if _conf_cands else 0.0) - stale_penalty)), 3)
     verdict_reason_parts: List[str] = []
-    if p_exceed_crit >= 0.5:
+    if p_exceed_crit is not None and p_exceed_crit >= 0.5:
         verdict_reason_parts.append(f"q90 ≥ ОЯ в {days_q90_over_crit} из {horizon_len} дней")
-    if p_exceed_low >= 0.5:
+    if p_exceed_low is not None and p_exceed_low >= 0.5:
         verdict_reason_parts.append(f"q90 ≥ НЯ в {days_q90_over_low} из {horizon_len} дней")
     if drivers:
         verdict_reason_parts.append(f"сработало правил: {len(drivers)}")
     if not verdict_reason_parts:
-        verdict_reason_parts.append("сигналы ниже порогов")
+        verdict_reason_parts.append(
+            "сигналы ниже порогов" if low is not None else "пороги НЯ/ОЯ не заданы — риск не оценивается")
     verdict = {
         "will_flood": bool(will_flood),
-        "level": verdict_level,  # green | yellow | red
-        "level_ru": {"green": "не ожидается", "yellow": "возможен", "red": "ожидается"}[verdict_level],
+        "level": verdict_level,  # green | yellow | red | unknown
+        "level_ru": {"green": "не ожидается", "yellow": "возможен",
+                     "red": "ожидается", "unknown": "не определён"}[verdict_level],
         "confidence": verdict_confidence,
-        "p_exceed_low": round(p_exceed_low, 3),
-        "p_exceed_crit": round(p_exceed_crit, 3),
+        "p_exceed_low": round(p_exceed_low, 3) if p_exceed_low is not None else None,
+        "p_exceed_crit": round(p_exceed_crit, 3) if p_exceed_crit is not None else None,
         "reason": "; ".join(verdict_reason_parts),
     }
 
@@ -624,10 +687,13 @@ def assess_flood_risk(
         f"{risk_class_ru} ({int(round(total))}/100)."
     )
     if peak_median is not None and peak_date:
-        parts.append(
-            f"Прогнозный пик уровня — {peak_median:.0f} см {peak_date} "
-            f"(ОЯ низкий {low:.0f}, критический {crit:.0f})."
-        )
+        _thr_txt = []
+        if low is not None:
+            _thr_txt.append(f"НЯ {low:.0f}")
+        if crit is not None:
+            _thr_txt.append(f"ОЯ {crit:.0f}")
+        _thr = (" (" + ", ".join(_thr_txt) + ")") if _thr_txt else ""
+        parts.append(f"Прогнозный пик уровня — {peak_median:.0f} см {peak_date}{_thr}.")
     if critical_days:
         first_crit = next((c for c in critical_days if c["level"] == "critical"), None)
         first_warn = next((c for c in critical_days if c["level"] == "warning"), None)

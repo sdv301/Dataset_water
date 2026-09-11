@@ -1,0 +1,365 @@
+{
+  "training_date": "2026-09-10T15:32:49.198543",
+  "river": "Лена",
+  "post": "Пеледуй",
+  "backend": "catboost",
+  "horizons": [
+    1,
+    3,
+    7,
+    14,
+    30
+  ],
+  "quantiles": [
+    0.1,
+    0.5,
+    0.9,
+    0.95
+  ],
+  "features": [
+    "temp_min",
+    "temp_mean",
+    "temp_max",
+    "precip_mm",
+    "snow_pct_norm",
+    "level_lag_1",
+    "level_lag_3",
+    "level_lag_7",
+    "level_lag_14",
+    "level_ma7",
+    "level_ma14",
+    "level_ma30",
+    "delta_1d",
+    "delta_3d",
+    "delta_7d",
+    "day_of_year",
+    "month",
+    "sin_doy",
+    "cos_doy",
+    "precip_sum_3d",
+    "precip_sum_7d",
+    "precip_sum_14d",
+    "ice_thickness_cm",
+    "temp_anomaly",
+    "level_vs_oya_pct",
+    "snow_depth_cm",
+    "swe_mm",
+    "precip_sum_30d",
+    "precip_sum_60d",
+    "precip_sum_90d",
+    "ice_event",
+    "is_summer"
+  ],
+  "metrics": {
+    "1": {
+      "0.1": {
+        "rmse": 42.78,
+        "mae": 22.41,
+        "pinball_loss": 2.7508,
+        "params": {
+          "iterations": 558,
+          "depth": 7,
+          "learning_rate": 0.13686402270873738,
+          "l2_leaf_reg": 0.0012242708184370245,
+          "subsample": 0.8219337840600954,
+          "loss_function": "Quantile:alpha=0.1",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.5": {
+        "rmse": 33.45,
+        "mae": 15.09,
+        "pinball_loss": 7.5446,
+        "params": {
+          "iterations": 356,
+          "depth": 7,
+          "learning_rate": 0.04207599845700554,
+          "l2_leaf_reg": 0.0011092159271148287,
+          "subsample": 0.6837670545727291,
+          "loss_function": "Quantile:alpha=0.5",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.9": {
+        "rmse": 137.9,
+        "mae": 120.02,
+        "pinball_loss": 13.1035,
+        "params": {
+          "iterations": 310,
+          "depth": 5,
+          "learning_rate": 0.007946419713548585,
+          "l2_leaf_reg": 0.24654500256293965,
+          "subsample": 0.8261220603636261,
+          "loss_function": "Quantile:alpha=0.9",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.95": {
+        "rmse": 88.69,
+        "mae": 74.36,
+        "pinball_loss": 4.3474,
+        "params": {
+          "iterations": 321,
+          "depth": 6,
+          "learning_rate": 0.01757260934165625,
+          "l2_leaf_reg": 0.008618209981128831,
+          "subsample": 0.6198168836031629,
+          "loss_function": "Quantile:alpha=0.95",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      }
+    },
+    "3": {
+      "0.1": {
+        "rmse": 98.85,
+        "mae": 59.87,
+        "pinball_loss": 6.7581,
+        "params": {
+          "iterations": 398,
+          "depth": 7,
+          "learning_rate": 0.03814198104556828,
+          "l2_leaf_reg": 0.0015912510027740398,
+          "subsample": 0.5137666372014124,
+          "loss_function": "Quantile:alpha=0.1",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.5": {
+        "rmse": 82.47,
+        "mae": 49.21,
+        "pinball_loss": 24.6037,
+        "params": {
+          "iterations": 745,
+          "depth": 3,
+          "learning_rate": 0.022290830950726984,
+          "l2_leaf_reg": 0.010311534563882304,
+          "subsample": 0.8913784253519224,
+          "loss_function": "Quantile:alpha=0.5",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.9": {
+        "rmse": 132.32,
+        "mae": 107.75,
+        "pinball_loss": 15.4323,
+        "params": {
+          "iterations": 609,
+          "depth": 3,
+          "learning_rate": 0.013402776161892564,
+          "l2_leaf_reg": 0.011241547307634199,
+          "subsample": 0.7726686837292811,
+          "loss_function": "Quantile:alpha=0.9",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.95": {
+        "rmse": 218.19,
+        "mae": 197.58,
+        "pinball_loss": 10.7458,
+        "params": {
+          "iterations": 537,
+          "depth": 10,
+          "learning_rate": 0.0034287662187817945,
+          "l2_leaf_reg": 3.6688709973908793,
+          "subsample": 0.9124207374663549,
+          "loss_function": "Quantile:alpha=0.95",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      }
+    },
+    "7": {
+      "0.1": {
+        "rmse": 67.86,
+        "mae": 29.62,
+        "pinball_loss": 3.0045,
+        "params": {
+          "iterations": 768,
+          "depth": 10,
+          "learning_rate": 0.29042339524813976,
+          "l2_leaf_reg": 0.02484572043099956,
+          "subsample": 0.7226791361711442,
+          "loss_function": "Quantile:alpha=0.1",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.5": {
+        "rmse": 121.45,
+        "mae": 82.25,
+        "pinball_loss": 41.1234,
+        "params": {
+          "iterations": 561,
+          "depth": 4,
+          "learning_rate": 0.007636075193054263,
+          "l2_leaf_reg": 0.05611701437256063,
+          "subsample": 0.8072920938220196,
+          "loss_function": "Quantile:alpha=0.5",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.9": {
+        "rmse": 150.07,
+        "mae": 121.15,
+        "pinball_loss": 14.3166,
+        "params": {
+          "iterations": 127,
+          "depth": 9,
+          "learning_rate": 0.03217176058681704,
+          "l2_leaf_reg": 0.0028255253529186138,
+          "subsample": 0.682792218921392,
+          "loss_function": "Quantile:alpha=0.9",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.95": {
+        "rmse": 301.91,
+        "mae": 275.72,
+        "pinball_loss": 14.5158,
+        "params": {
+          "iterations": 239,
+          "depth": 10,
+          "learning_rate": 0.00505293331585092,
+          "l2_leaf_reg": 0.0176146423112376,
+          "subsample": 0.9375030164087204,
+          "loss_function": "Quantile:alpha=0.95",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      }
+    },
+    "14": {
+      "0.1": {
+        "rmse": 229.22,
+        "mae": 165.71,
+        "pinball_loss": 18.4105,
+        "params": {
+          "iterations": 634,
+          "depth": 9,
+          "learning_rate": 0.0028328239286608977,
+          "l2_leaf_reg": 0.005668556962457033,
+          "subsample": 0.7400811403774947,
+          "loss_function": "Quantile:alpha=0.1",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.5": {
+        "rmse": 143.34,
+        "mae": 108.97,
+        "pinball_loss": 54.4861,
+        "params": {
+          "iterations": 654,
+          "depth": 4,
+          "learning_rate": 0.003088146294225043,
+          "l2_leaf_reg": 0.0011049860178369922,
+          "subsample": 0.9040684918113306,
+          "loss_function": "Quantile:alpha=0.5",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.9": {
+        "rmse": 325.42,
+        "mae": 290.24,
+        "pinball_loss": 32.3501,
+        "params": {
+          "iterations": 747,
+          "depth": 3,
+          "learning_rate": 0.0016079396470608813,
+          "l2_leaf_reg": 0.07839912056349617,
+          "subsample": 0.846205272871321,
+          "loss_function": "Quantile:alpha=0.9",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.95": {
+        "rmse": 413.76,
+        "mae": 378.92,
+        "pinball_loss": 20.2145,
+        "params": {
+          "iterations": 185,
+          "depth": 7,
+          "learning_rate": 0.0034440302130408036,
+          "l2_leaf_reg": 0.08302997594131478,
+          "subsample": 0.6797720011090904,
+          "loss_function": "Quantile:alpha=0.95",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      }
+    },
+    "30": {
+      "0.1": {
+        "rmse": 302.43,
+        "mae": 230.37,
+        "pinball_loss": 29.0602,
+        "params": {
+          "iterations": 170,
+          "depth": 7,
+          "learning_rate": 0.001055847902424865,
+          "l2_leaf_reg": 0.13523946603438236,
+          "subsample": 0.6278926546500472,
+          "loss_function": "Quantile:alpha=0.1",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.5": {
+        "rmse": 116.81,
+        "mae": 77.94,
+        "pinball_loss": 38.9701,
+        "params": {
+          "iterations": 459,
+          "depth": 9,
+          "learning_rate": 0.011575863278028906,
+          "l2_leaf_reg": 0.18951855968417033,
+          "subsample": 0.9001631510241173,
+          "loss_function": "Quantile:alpha=0.5",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.9": {
+        "rmse": 286.17,
+        "mae": 245.25,
+        "pinball_loss": 28.9269,
+        "params": {
+          "iterations": 355,
+          "depth": 4,
+          "learning_rate": 0.007326232789641964,
+          "l2_leaf_reg": 0.8373255210439625,
+          "subsample": 0.7784235106177222,
+          "loss_function": "Quantile:alpha=0.9",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      },
+      "0.95": {
+        "rmse": 297.59,
+        "mae": 257.88,
+        "pinball_loss": 14.744,
+        "params": {
+          "iterations": 225,
+          "depth": 5,
+          "learning_rate": 0.01868043801318096,
+          "l2_leaf_reg": 0.007283839877479723,
+          "subsample": 0.5447461598527812,
+          "loss_function": "Quantile:alpha=0.95",
+          "random_seed": 42,
+          "verbose": 0
+        }
+      }
+    }
+  }
+}

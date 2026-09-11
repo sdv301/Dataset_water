@@ -1183,6 +1183,73 @@ async def get_river_posts(river: str):
         conn.close()
 
 
+# ----------------------------- Карта безопасности ----------------------------
+
+@app.get("/api/map/latest")
+async def api_map_latest():
+    """Лёгкий эндпоинт «Карты безопасности»: все посты с координатами + последний
+    snapshot риска из agent_snapshots (ночной/ручной прогон агента). Без ML-вычислений.
+    Поля порогов — реальные (None/0, если не заданы), без фейков 500/650.
+    """
+    conn = _get_db()
+    try:
+        stations = conn.execute(
+            "SELECT river, post, lat, lon, critical_oya, low_oya, threshold_source "
+            "FROM stations WHERE lat IS NOT NULL AND lon IS NOT NULL "
+            "ORDER BY river, post"
+        ).fetchall()
+        snaps = {}
+        try:
+            for r in conn.execute(
+                "SELECT river, post, risk_class, will_flood, confidence, computed_at, payload_json "
+                "FROM agent_snapshots"
+            ):
+                snaps[r["river"] + "|" + r["post"]] = r
+        except sqlite3.OperationalError:
+            snaps = {}  # таблица ещё не создана планировщиком
+    finally:
+        conn.close()
+
+    points = []
+    for s in stations:
+        key = s["river"] + "|" + s["post"]
+        sn = snaps.get(key)
+        verdict = None
+        peak = None
+        if sn and sn["payload_json"]:
+            try:
+                pl = json.loads(sn["payload_json"])
+                v = pl.get("verdict") or {}
+                verdict = {
+                    "level": v.get("level"), "level_ru": v.get("level_ru"),
+                    "confidence": v.get("confidence"), "will_flood": v.get("will_flood"),
+                }
+                fp = pl.get("forecast_peak") or {}
+                peak = {"level_cm": fp.get("level_cm"), "date": fp.get("date")}
+            except Exception:  # noqa: BLE001
+                pass
+        points.append({
+            "river": s["river"],
+            "post": s["post"],
+            "lat": s["lat"],
+            "lon": s["lon"],
+            "critical_oya": s["critical_oya"],
+            "low_oya": s["low_oya"],
+            "threshold_source": s["threshold_source"],
+            "risk_class": sn["risk_class"] if sn else None,
+            "will_flood": bool(sn["will_flood"]) if sn else None,
+            "confidence": sn["confidence"] if sn else None,
+            "computed_at": sn["computed_at"] if sn else None,
+            "verdict": verdict,
+            "forecast_peak": peak,
+        })
+    return {
+        "count": len(points),
+        "points": points,
+        "generated_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
 # ----------------------------- Прогноз -------------------------------
 
 @app.get("/api/forecast/{river}/{post}", response_model=ForecastResponse)
@@ -1212,8 +1279,8 @@ async def get_forecast(
     finally:
         conn.close()
 
-    critical_oya = dict(station_row).get("critical_oya", 650.0) or 650.0
-    low_oya = dict(station_row).get("low_oya", 500.0) or 500.0
+    critical_oya = dict(station_row).get("critical_oya") or 0.0
+    low_oya = dict(station_row).get("low_oya") or 0.0
 
     station_meta = StationMeta(
         post=post, river=river, critical_oya=critical_oya, low_oya=low_oya,
@@ -1950,23 +2017,13 @@ async def get_data_stats():
 
 @app.post("/api/upload")
 async def upload_data_file(file: UploadFile = File(...)):
-    """Загрузка новых данных CSV/Excel и пересборка базы."""
-    # Сохраняем файл в папку export
-    export_dir = _SCRIPT_DIR.parent / "Реки" / "данные январь" / "export"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    
-    file_path = export_dir / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    # Запуск скрипта подготовки данных
-    try:
-        subprocess.run(["python", str(_SCRIPT_DIR / "prepare_ml_data.py")], check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error during data preparation: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка при обработке файла и пересборке БД.")
-        
-    return {"message": f"Файл {file.filename} успешно загружен, БД пересобрана."}
+    """Отключено: этот эндпоинт пересобирает БД через prepare_ml_data.py и может
+    уничтожить аккуратно импортированные данные. Используйте офлайн-импорт."""
+    raise HTTPException(
+        status_code=410,
+        detail="Загрузка через /api/upload отключена. Используйте "
+               "python import_excel_update.py (офлайн, авто-бэкап, миграция порогов).",
+    )
 
 
 # ---------------------------------------------------------------------------

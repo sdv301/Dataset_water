@@ -586,6 +586,80 @@ class FloodPredictor:
                 row[c] = 0.0
         return pd.DataFrame([row], columns=self.features)
 
+    def _load_latest_features(self, on_or_before: datetime.date) -> Optional[pd.DataFrame]:
+        """Последняя доступная строка фичей на/до даты — fallback при устаревших данных.
+
+        Если для base_date нет строки (данные устарели либо это будущее), берём
+        самую свежую доступную строку, чтобы прогноз строился от последнего
+        наблюдения, а не от нулевых признаков.
+        """
+        if not os.path.exists(self.db_path):
+            return None
+        conn = sqlite3.connect(self.db_path)
+        try:
+            query = (
+                "SELECT * FROM daily_features "
+                "WHERE river = ? AND post = ? AND date <= ? "
+                "ORDER BY date DESC LIMIT 1"
+            )
+            df = pd.read_sql_query(
+                query, conn,
+                params=(self._river, self._post, on_or_before.isoformat()),
+            )
+        finally:
+            conn.close()
+        if df.empty:
+            return None
+        if not self.features:
+            self.features = [
+                c for c in df.columns
+                if c not in ("date", "river", "post", "water_level_cm")
+            ]
+        row = {}
+        for c in self.features:
+            if c in df.columns:
+                val = df[c].iloc[0]
+                try:
+                    row[c] = float(val) if pd.notna(val) else 0.0
+                except (TypeError, ValueError):
+                    row[c] = 0.0
+            else:
+                row[c] = 0.0
+        return pd.DataFrame([row], columns=self.features)
+
+    def _level_bounds(self) -> Tuple[Optional[float], Optional[float]]:
+        """Наблюдённый диапазон уровня воды по посту (для клиппинга хвостов).
+
+        Возвращает (min_level - 50, max_level + 200) или (None, None), если
+        данных нет. Кешируется на экземпляре (флаг _lvl_queried). Нижняя
+        граница используется для отсечения нефизичных отрицательных хвостов
+        квантильной регрессии; верхняя пока возвращается для полноты.
+        """
+        if getattr(self, "_lvl_queried", False):
+            return self._lvl_lo, self._lvl_hi
+        self._lvl_queried = True
+        lo: Optional[float] = None
+        hi: Optional[float] = None
+        if self._river and self._post and os.path.exists(self.db_path):
+            try:
+                conn = sqlite3.connect(self.db_path)
+                try:
+                    row = conn.execute(
+                        "SELECT MIN(water_level_cm), MAX(water_level_cm) "
+                        "FROM daily_features WHERE river = ? AND post = ?",
+                        (self._river, self._post),
+                    ).fetchone()
+                    if row and row[0] is not None:
+                        lo = float(row[0]) - 50.0
+                        hi = float(row[1]) + 200.0
+                finally:
+                    conn.close()
+            except Exception:
+                lo = hi = None
+        self._lvl_lo = lo
+        self._lvl_hi = hi
+        return lo, hi
+
     def predict(
         self,
         date: datetime.date,
@@ -615,10 +689,14 @@ class FloodPredictor:
             # Попытка загрузить реальные фичи из БД
             X = self._load_features_from_db(date)
             if X is None:
-                # Заглушка: нулевые фичи
-                X = pd.DataFrame(
-                    [[0] * len(self.features)], columns=self.features
-                )
+                # Нет строки для base_date (данные устарели / будущее) — берём
+                # последнюю доступную строку, чтобы прогноз шёл от последнего
+                # наблюдения, а не от нулевых признаков (fix silent zero-fill).
+                X = self._load_latest_features(date)
+            if X is None:
+                # Нет ни одной строки с фичами по станции — честно пропускаем
+                # горизонт, не генерируя мусорный прогноз из нулей.
+                continue
 
             preds = {}
             for q in self.quantiles:
@@ -626,6 +704,29 @@ class FloodPredictor:
                     continue
                 model = self.models[h][q]
                 preds[f"q{int(q * 100)}"] = float(model.predict(X)[0])
+
+            # Пост-обработка квантильных прогнозов:
+            #   1) клиппинг нижнего хвоста к наблюдённому минимуму поста —
+            #      убирает нефизичные артефакты квантильной регрессии на хвостах
+            #      (напр. q10 = -89 см; уровень отсчитывается от нуля графика и
+            #      не должен уходить далеко в минус);
+            #   2) монотонизация q10 <= q50 <= q90 <= q95 (cumulative-min справа)
+            #      — убирает «quantile crossing», сохраняя медиану. Верхний
+            #      хвост НЕ клиппируем, чтобы не ограничивать прогноз паводков.
+            qkeys = ("q10", "q50", "q90", "q95")
+            present = [k for k in qkeys if k in preds]
+            if present:
+                lo, _hi = self._level_bounds()
+                vals = [preds[k] for k in present]
+                if lo is not None:
+                    vals = [max(v, lo) for v in vals]
+                # cumulative-min справа налево -> неубывающий порядок;
+                # опускаем только «нижние» квантили, медиану сохраняем.
+                for i in range(len(vals) - 2, -1, -1):
+                    if vals[i] > vals[i + 1]:
+                        vals[i] = vals[i + 1]
+                for k, v in zip(present, vals):
+                    preds[k] = float(v)
 
             result: Dict[str, Any] = {
                 "date": date + timedelta(days=h),

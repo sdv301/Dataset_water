@@ -276,3 +276,31 @@ def update_config(hour: Optional[int] = None, minute: Optional[int] = None,
     _seconds_until_next_run()
     return get_status()
 
+
+def main() -> int:
+    """CLI: однократный прогон агента по всем станциям (--once) или постоянный цикл (--loop)."""
+    import argparse
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    ap = argparse.ArgumentParser(description="Планировщик агента HydroPredict")
+    ap.add_argument("--once", action="store_true",
+                    help="Однократный прогон агента по всем станциям + snapshot, затем выход")
+    ap.add_argument("--loop", action="store_true",
+                    help="Запустить постоянный цикл (как в api_server)")
+    ap.add_argument("--horizon", type=int, default=_DEFAULT_HORIZON,
+                    help=f"Горизонт прогноза в днях (по умолчанию {_DEFAULT_HORIZON})")
+    args = ap.parse_args()
+
+    if args.loop:
+        init_scheduler()
+        _loop()  # бесконечный
+        return 0
+    # по умолчанию и с --once — однократный прогон
+    stats = _run_all(int(args.horizon))
+    print(json.dumps(stats, ensure_ascii=False, indent=2))
+    return 0 if not stats.get("errors") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

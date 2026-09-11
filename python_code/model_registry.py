@@ -73,6 +73,7 @@ class ModelRegistry:
 
         # Обновляем манифест
         manifest = self._load_or_create_manifest(river, post)
+        manifest.setdefault("models", {})  # толерантность к legacy-манифестам без "models"
         key = f"h{horizon}_q{int(quantile * 100)}"
         manifest["models"][key] = {
             "horizon": horizon,
