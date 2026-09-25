@@ -607,24 +607,30 @@ def assess_flood_risk(
     peak_q90, peak_q90_date = _peak_by("q90")
     peak_q10, peak_q10_date = _peak_by("q10")
 
-    # --- Вердикт «будет паводок» — СТРОГИЙ порог ---
-    # will_flood = P(q90 ≥ НЯ по горизонту) ≥ 0.7  (строго, без доп. условий по драйверам/prob)
+    # --- Вердикт «будет паводок» — пороги из agent_config (default 0.7) ---
+    try:
+        import agent_scheduler as _asch
+        _thr = _asch.get_thresholds()
+        _wf_thr = float(_thr.get("will_flood_threshold", 0.7))
+        _red_thr = float(_thr.get("verdict_red_threshold", 0.7))
+    except Exception:
+        _wf_thr, _red_thr = 0.7, 0.7
+
     days_q90_over_low = sum(
-        1 for p in forecast_points
-        if low is not None and p.get("q90") is not None and p.get("q90") >= low
+        1 for p_pt in forecast_points
+        if low is not None and p_pt.get("q90") is not None and p_pt.get("q90") >= low
     )
     days_q90_over_crit = sum(
-        1 for p in forecast_points
-        if crit is not None and p.get("q90") is not None and p.get("q90") >= crit
+        1 for p_pt in forecast_points
+        if crit is not None and p_pt.get("q90") is not None and p_pt.get("q90") >= crit
     )
     horizon_len = max(1, len(forecast_points))
     p_exceed_low = (days_q90_over_low / horizon_len) if low is not None else None
     p_exceed_crit = (days_q90_over_crit / horizon_len) if crit is not None else None
 
-    # Строгое правило для will_flood (ТЗ): только доля дней где q90 ≥ НЯ.
-    # Если пороги не заданы — честный вердикт «не определён» вместо фейка 500/650.
-    will_flood = (p_exceed_low is not None and p_exceed_low >= 0.7)
-    verdict_red = (p_exceed_crit is not None and p_exceed_crit >= 0.7)
+    # will_flood = P(q90 ≥ НЯ) ≥ порога; red = P(q90 ≥ ОЯ) ≥ порога.
+    will_flood = (p_exceed_low is not None and p_exceed_low >= _wf_thr)
+    verdict_red = (p_exceed_crit is not None and p_exceed_crit >= _red_thr)
     verdict_yellow = will_flood and not verdict_red
     verdict_level = ("red" if verdict_red else ("yellow" if verdict_yellow else
                        ("green" if low is not None else "unknown")))
@@ -657,6 +663,8 @@ def assess_flood_risk(
         "confidence": verdict_confidence,
         "p_exceed_low": round(p_exceed_low, 3) if p_exceed_low is not None else None,
         "p_exceed_crit": round(p_exceed_crit, 3) if p_exceed_crit is not None else None,
+        "will_flood_threshold": _wf_thr,
+        "verdict_red_threshold": _red_thr,
         "reason": "; ".join(verdict_reason_parts),
     }
 

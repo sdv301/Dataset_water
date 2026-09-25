@@ -25,12 +25,17 @@ _YAKUTSK_TZ = _dt.timezone(_dt.timedelta(hours=9))
 _DEFAULT_HOUR = 3
 _DEFAULT_MINUTE = 0
 _DEFAULT_HORIZON = 14
+_DEFAULT_WILL_FLOOD_THR = 0.7
+_DEFAULT_VERDICT_RED_THR = 0.7
+_CONFIG_PATH = hs.PROJECT_ROOT / "data" / "agent_config.json"
 
 _state = {
     "enabled": True,
     "hour": _DEFAULT_HOUR,
     "minute": _DEFAULT_MINUTE,
     "horizon": _DEFAULT_HORIZON,
+    "will_flood_threshold": _DEFAULT_WILL_FLOOD_THR,
+    "verdict_red_threshold": _DEFAULT_VERDICT_RED_THR,
     "last_run_started": None,
     "last_run_finished": None,
     "last_run_stats": None,
@@ -41,6 +46,112 @@ _state = {
 _state_lock = threading.Lock()
 _stop_event = threading.Event()
 _SNAPSHOT_SCHEMA_READY = False
+
+
+def _load_persisted_config() -> None:
+    try:
+        if not _CONFIG_PATH.exists():
+            return
+        data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+        with _state_lock:
+            for k in ("hour", "minute", "horizon", "enabled", "will_flood_threshold", "verdict_red_threshold"):
+                if k in data:
+                    _state[k] = data[k]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Не удалось загрузить agent_config: %s", exc)
+
+
+def _save_persisted_config() -> None:
+    try:
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _state_lock:
+            payload = {k: _state[k] for k in ("hour", "minute", "horizon", "enabled", "will_flood_threshold", "verdict_red_threshold")}
+        _CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Не удалось сохранить agent_config: %s", exc)
+
+
+def get_thresholds() -> Dict[str, float]:
+    with _state_lock:
+        return {
+            "will_flood_threshold": float(_state.get("will_flood_threshold", _DEFAULT_WILL_FLOOD_THR)),
+            "verdict_red_threshold": float(_state.get("verdict_red_threshold", _DEFAULT_VERDICT_RED_THR)),
+        }
+
+
+def get_agent_config() -> Dict[str, Any]:
+    with _state_lock:
+        s = dict(_state)
+    s["thresholds"] = {
+        "will_flood_threshold": float(s.get("will_flood_threshold", _DEFAULT_WILL_FLOOD_THR)),
+        "verdict_red_threshold": float(s.get("verdict_red_threshold", _DEFAULT_VERDICT_RED_THR)),
+    }
+    return s
+
+
+def self_check() -> Dict[str, Any]:
+    """Coverage + health отчёт для UI /api/agent/self-check."""
+    gaps: List[Dict[str, Any]] = []
+    try:
+        conn = hs.get_db()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM daily_features").fetchone()[0]
+            # coverage за последние 90 дней
+            for col, label in [
+                ("snow_pct_norm", "Снегозапас"),
+                ("ice_thickness_cm", "Толщина льда"),
+                ("temp_anomaly", "Аномалия температуры"),
+                ("precip_sum_30d", "Осадки 30д"),
+                ("level_vs_oya_pct", "Уровень vs ОЯ"),
+            ]:
+                try:
+                    nn = conn.execute(f"SELECT COUNT(*) FROM daily_features WHERE {col} IS NOT NULL").fetchone()[0]
+                except sqlite3.OperationalError:
+                    nn = 0
+                pct = (nn / total * 100) if total else 0
+                if pct < 5:
+                    gaps.append({"feature": col, "label": label, "non_null": nn, "pct": round(pct, 2), "severity": "high" if col == "snow_pct_norm" else "medium"})
+            # stale stations: нет данных за 60 дней
+            try:
+                stale = conn.execute("SELECT river, post, MAX(date) as last_date FROM daily_features GROUP BY river, post HAVING last_date < date('now','-60 days')").fetchall()
+                stale_list = [{"river": r[0], "post": r[1], "last_date": r[2]} for r in stale[:20]]
+            except Exception:
+                stale_list = []
+            # 5 постов без ОЯ
+            try:
+                missing_oya = conn.execute("SELECT river, post FROM stations WHERE critical_oya IS NULL OR low_oya IS NULL").fetchall()
+                missing_oya_n = len(missing_oya)
+            except Exception:
+                missing_oya_n = 0
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "gaps": gaps}
+    # model age
+    model_age_days: Optional[int] = None
+    try:
+        # ищем любой manifest
+        import glob
+        manifests = list((hs.MODELS_DIR).rglob("manifest.json"))
+        if manifests:
+            mtimes = [p.stat().st_mtime for p in manifests]
+            newest = max(mtimes)
+            model_age_days = int((time.time() - newest) / 86400)
+    except Exception:
+        pass
+    with _state_lock:
+        last_stats = _state.get("last_run_stats")
+    return {
+        "ok": True,
+        "total_rows": total,
+        "gaps": gaps,
+        "stale_stations": stale_list,
+        "stale_count": len(stale_list),
+        "missing_oya_count": missing_oya_n,
+        "model_age_days": model_age_days,
+        "last_run_stats": last_stats,
+        "snapshot_stats": snapshot_stats(),
+    }
 
 
 def _ensure_snapshot_schema(conn: sqlite3.Connection) -> None:
@@ -149,9 +260,6 @@ def snapshot_stats() -> Dict[str, Any]:
             will_flood_total += r["n"]
     return {"total": total, "by_class": by_class, "will_flood": will_flood_total, "latest": latest}
 
-    _ensure_snapshot_schema(conn)
-    return conn
-
 
 def _list_stations() -> List[Tuple[str, str]]:
     conn = hs.get_db()
@@ -229,6 +337,7 @@ def _loop() -> None:
 
 
 def init_scheduler() -> None:
+    _load_persisted_config()
     with _state_lock:
         if _state["thread_started"]:
             return
@@ -257,7 +366,9 @@ def get_status() -> Dict[str, Any]:
 
 
 def update_config(hour: Optional[int] = None, minute: Optional[int] = None,
-                  enabled: Optional[bool] = None, horizon: Optional[int] = None) -> Dict[str, Any]:
+                  enabled: Optional[bool] = None, horizon: Optional[int] = None,
+                  will_flood_threshold: Optional[float] = None,
+                  verdict_red_threshold: Optional[float] = None) -> Dict[str, Any]:
     with _state_lock:
         if hour is not None:
             if not (0 <= hour <= 23):
@@ -273,6 +384,17 @@ def update_config(hour: Optional[int] = None, minute: Optional[int] = None,
             if not (1 <= horizon <= 60):
                 raise ValueError("horizon должен быть 1..60")
             _state["horizon"] = int(horizon)
+        if will_flood_threshold is not None:
+            v = float(will_flood_threshold)
+            if not (0.1 <= v <= 0.99):
+                raise ValueError("will_flood_threshold должен быть 0.1..0.99")
+            _state["will_flood_threshold"] = v
+        if verdict_red_threshold is not None:
+            v = float(verdict_red_threshold)
+            if not (0.1 <= v <= 0.99):
+                raise ValueError("verdict_red_threshold должен быть 0.1..0.99")
+            _state["verdict_red_threshold"] = v
+    _save_persisted_config()
     _seconds_until_next_run()
     return get_status()
 

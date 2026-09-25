@@ -859,6 +859,8 @@ class _SchedConfigPayload(BaseModel):
     minute: Optional[int] = None
     enabled: Optional[bool] = None
     horizon: Optional[int] = None
+    will_flood_threshold: Optional[float] = None
+    verdict_red_threshold: Optional[float] = None
 
 
 @app.post("/api/agent/scheduler/config")
@@ -868,9 +870,23 @@ async def agent_scheduler_config(payload: _SchedConfigPayload):
         return agent_scheduler.update_config(
             hour=payload.hour, minute=payload.minute,
             enabled=payload.enabled, horizon=payload.horizon,
+            will_flood_threshold=payload.will_flood_threshold,
+            verdict_red_threshold=payload.verdict_red_threshold,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/agent/self-check")
+async def agent_self_check():
+    import agent_scheduler
+    return agent_scheduler.self_check()
+
+
+@app.get("/api/agent/config")
+async def agent_config():
+    import agent_scheduler
+    return agent_scheduler.get_agent_config()
 
 
 
@@ -1183,13 +1199,112 @@ async def get_river_posts(river: str):
         conn.close()
 
 
-# ----------------------------- Карта безопасности ----------------------------
+# ----------------------------- Карта безопасности / Атлас ----------------------------
+
+_ATLAS_DISCLAIMER = (
+    "Шаблоны затопления — индикативные буферы вокруг гидропостов по риску агента "
+    "(не кадастр, не зоны по ЦМР/гидромодели). Для оперативной ориентировки."
+)
+
+
+def _haversine_ring(lat: float, lon: float, radius_km: float, n: int = 48) -> list:
+    """Круг на сфере → список [lon, lat] (замкнутый ring GeoJSON)."""
+    if radius_km <= 0 or lat is None or lon is None:
+        return []
+    r_lat = radius_km / 111.32
+    cos_lat = math.cos(math.radians(lat))
+    r_lon = radius_km / (111.32 * max(abs(cos_lat), 0.05))
+    ring = []
+    for i in range(n):
+        ang = 2.0 * math.pi * i / n
+        ring.append([lon + r_lon * math.cos(ang), lat + r_lat * math.sin(ang)])
+    ring.append(ring[0])
+    return ring
+
+
+def _indicative_buffer_km(
+    risk_class: Optional[str],
+    will_flood: Optional[bool],
+    peak_cm: Optional[float],
+    low_oya: Optional[float],
+    critical_oya: Optional[float],
+) -> float:
+    """Радиус индикативного буфера (км) v1: low→0; moderate 2–4; high 5–8; critical 8–15."""
+    rc = (risk_class or "").lower().strip()
+    base = 0.0
+    if will_flood or rc == "critical":
+        base = 10.0
+    elif rc == "high":
+        base = 6.5
+    elif rc in ("moderate", "medium"):
+        base = 3.0
+    else:
+        return 0.0
+
+    scale = 0.0
+    try:
+        if peak_cm is not None and low_oya is not None:
+            span = max(float(critical_oya or 0) - float(low_oya), 1.0)
+            excess = max(float(peak_cm) - float(low_oya), 0.0)
+            scale = min(excess / span, 1.5)
+    except (TypeError, ValueError):
+        scale = 0.0
+
+    if will_flood or rc == "critical":
+        return float(min(max(base + scale * 5.0, 8.0), 15.0))
+    if rc == "high":
+        return float(min(max(base + scale * 1.5, 5.0), 8.0))
+    return float(min(max(base + scale * 1.0, 2.0), 4.0))
+
+
+def _build_atlas_templates(points: list) -> dict:
+    """FeatureCollection индикативных буферов (on-the-fly из snapshots)."""
+    features = []
+    for p in points:
+        lat, lon = p.get("lat"), p.get("lon")
+        if lat is None or lon is None:
+            continue
+        peak = p.get("forecast_peak") or {}
+        peak_cm = peak.get("level_cm") if isinstance(peak, dict) else None
+        radius = _indicative_buffer_km(
+            p.get("risk_class"), p.get("will_flood"), peak_cm,
+            p.get("low_oya"), p.get("critical_oya"),
+        )
+        if radius <= 0:
+            continue
+        ring = _haversine_ring(float(lat), float(lon), radius)
+        if len(ring) < 4:
+            continue
+        conf = p.get("confidence")
+        try:
+            conf_f = float(conf) if conf is not None else 0.5
+        except (TypeError, ValueError):
+            conf_f = 0.5
+        conf_f = max(0.15, min(conf_f, 1.0))
+        rc = (p.get("risk_class") or "moderate").lower()
+        zone = "oya" if (p.get("will_flood") or rc in ("high", "critical")) else "nya"
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+            "properties": {
+                "river": p.get("river"),
+                "post": p.get("post"),
+                "risk_class": p.get("risk_class"),
+                "will_flood": bool(p.get("will_flood")) if p.get("will_flood") is not None else None,
+                "confidence": conf_f,
+                "radius_km": round(radius, 2),
+                "zone": zone,
+                "template": "indicative_buffer",
+                "disclaimer": _ATLAS_DISCLAIMER,
+            },
+        })
+    return {"type": "FeatureCollection", "features": features}
+
 
 @app.get("/api/map/latest")
 async def api_map_latest():
-    """Лёгкий эндпоинт «Карты безопасности»: все посты с координатами + последний
-    snapshot риска из agent_snapshots (ночной/ручной прогон агента). Без ML-вычислений.
-    Поля порогов — реальные (None/0, если не заданы), без фейков 500/650.
+    """Лёгкий эндпоинт «Карты безопасности» / Атласа: посты + snapshot риска +
+    индикативные шаблоны затопления (буферы). Без ML-вычислений и без DEM.
     """
     conn = _get_db()
     try:
@@ -1243,9 +1358,16 @@ async def api_map_latest():
             "verdict": verdict,
             "forecast_peak": peak,
         })
+    templates = _build_atlas_templates(points)
     return {
         "count": len(points),
         "points": points,
+        "templates": templates,
+        "meta": {
+            "template_method": "indicative_buffer_v1",
+            "disclaimer": _ATLAS_DISCLAIMER,
+            "template_count": len(templates.get("features") or []),
+        },
         "generated_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 

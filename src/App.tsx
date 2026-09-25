@@ -6,10 +6,8 @@ import {
 import {
   Map, Activity, Calendar, LayoutDashboard, Settings2,
   Thermometer, CloudRain, Snowflake, AlertOctagon, TrendingUp, AlertTriangle, Plus, X, BarChart2,
-  Database, Upload, RefreshCw, FileText, Loader2, Crosshair, Droplets,
+  Database, Upload, RefreshCw, FileText, Loader2, Droplets,
 } from './components/icons';
-import MapGL, { Marker, type ViewStateChangeEvent } from 'react-map-gl/maplibre';
-import 'maplibre-gl/dist/maplibre-gl.css';
 import { format, addDays, subDays } from 'date-fns';
 import { ru } from 'date-fns/locale';
 import {
@@ -25,11 +23,12 @@ import { BacktestPanel } from './components/BacktestPanel';
 import { AnalogPanel } from './components/AnalogPanel';
 import { AgentSettingsPanel } from './components/AgentSettingsPanel';
 import { QualityPanel } from './components/QualityPanel';
+import { AtlasMap } from './components/AtlasMap';
 import { notifyTrainingFinished, requestTrainingNotifications } from './utils/trainingNotify';
-import { API_BASE, MAP_SATELLITE_TILES_URL } from './config';
+import { API_BASE } from './config';
 
 // --- Types & API ---
-type ForecastMode = 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data' | 'scenario' | 'agent';
+type ForecastMode = 'atlas' | 'short' | 'medium' | 'season' | 'year' | 'norm' | 'dashboards' | 'data' | 'scenario' | 'agent';
 type WidgetId = 'cross_model' | 'scatter' | 'basin_risk' | 'feature_importance' | 'heatmap' | 'risk_pie' | 'peak_analysis';
 
 interface StationInfo {
@@ -122,65 +121,9 @@ const generateMockData = (days: number, baseLevel: number, tempMod: number, prec
   });
 };
 
-function getRiverBounds(riverStations: StationInfo[]): { center: [number, number]; zoom: number } {
-  if (riverStations.length === 0) return { center: [63, 130], zoom: 4 };
-  const lat = riverStations.reduce((s, st) => s + st.lat, 0) / riverStations.length;
-  const lng = riverStations.reduce((s, st) => s + st.lng, 0) / riverStations.length;
-  const latSpan = Math.max(...riverStations.map(s => s.lat)) - Math.min(...riverStations.map(s => s.lat));
-  const lngSpan = Math.max(...riverStations.map(s => s.lng)) - Math.min(...riverStations.map(s => s.lng));
-  const span = Math.max(latSpan, lngSpan);
-  let zoom = 8;
-  if (riverStations.length > 1) {
-    if (span > 8) zoom = 4;
-    else if (span > 4) zoom = 5;
-    else if (span > 2) zoom = 6;
-    else zoom = 7;
-  }
-  return { center: [lat, lng], zoom };
-}
-
-// Станции загружаются только из API /api/rivers + /api/rivers/{river}/posts (БД). Хардкода нет.
-const FALLBACK_STATION_HINT: StationInfo | null = null;
-
-// --- MapLibre raster style builder (Task 7) ---
-function buildRasterStyle(
-  name: string,
-  sourceId: string,
-  tilesUrl: string,
-  maxzoom = 19,
-) {
-  return {
-    version: 8 as const,
-    name,
-    sources: {
-      [sourceId]: {
-        type: 'raster' as const,
-        tiles: [tilesUrl],
-        tileSize: 256,
-        maxzoom,
-      },
-    },
-    layers: [
-      {
-        id: `${sourceId}-layer`,
-        type: 'raster' as const,
-        source: sourceId,
-        minzoom: 0,
-        maxzoom: 22,
-      },
-    ],
-  };
-}
-
-const SATELLITE_STYLE = buildRasterStyle(
-  'Satellite',
-  'satellite-tiles',
-  MAP_SATELLITE_TILES_URL,
-  18,
-);
 
 export default function App() {
-  const [mode, setMode] = useState<ForecastMode>('short');
+  const [mode, setMode] = useState<ForecastMode>('atlas');
   const [activeWidgets, setActiveWidgets] = useState<WidgetId[]>(['peak_analysis', 'cross_model', 'scatter', 'basin_risk']);
   const [stations, setStations] = useState<StationInfo[]>([]);
   const [station, setStation] = useState('');
@@ -236,19 +179,6 @@ export default function App() {
   const [precipMod, setPrecipMod] = useState(100);
   const [snowMod, setSnowMod] = useState(100);
   
-  const [mapStyle] = useState<'scheme' | 'satellite'>('satellite');
-  const [mapData, setMapData] = useState<'risk'>('risk');
-  // Карта безопасности: риск/вердикт по постам из agent_snapshots (/api/map/latest)
-  const [mapRisk, setMapRisk] = useState<Record<string, any>>({});
-  const [mapCenter, setMapCenter] = useState<[number, number]>([63, 130]);
-  const [mapZoom, setMapZoom] = useState(4);
-
-  const centerOnRiver = useCallback((river: string) => {
-    const riverStations = stations.filter(s => s.river === river);
-    const { center, zoom } = getRiverBounds(riverStations);
-    setMapCenter(center);
-    setMapZoom(zoom);
-  }, [stations]);
 
   const loadStationsFromApi = useCallback((preserveLabel?: string) => {
     return fetch(`${API_BASE}/rivers`)
@@ -521,13 +451,6 @@ export default function App() {
   }, [station, currentStation?.critical_oya, currentStation?.low_oya]);
 
   useEffect(() => {
-    if (currentStation) {
-      setMapCenter([currentStation.lat, currentStation.lng]);
-      setMapZoom(9);
-    }
-  }, [station, currentStation?.lat, currentStation?.lng]);
-
-  useEffect(() => {
     if (!currentStation) return;
     const key = `${currentStation.river}|${currentStation.post}`;
     if (stationKeyRef.current !== key) {
@@ -702,21 +625,6 @@ export default function App() {
     return { historyMapped: histMap, forecastMapped: foreMap, forecastData: [...histMap, ...foreMap] };
   }, [apiForecast, apiHistory, tempMod, precipMod, targetDate, mode]);
 
-  // Карта безопасности: загрузка snapshot-риска из /api/map/latest (без ML на клиенте).
-  // Запускается, когда станции загрузились (length 0→N), и обновляет mapRisk по постам.
-  useEffect(() => {
-    let alive = true;
-    fetch(`${API_BASE}/map/latest`)
-      .then((r) => (r.ok ? r.json() : Promise.resolve(null)))
-      .then((data: any) => {
-        if (!alive || !data || !Array.isArray(data.points)) return;
-        const byKey: Record<string, any> = {};
-        for (const p of data.points) byKey[`${p.river}|${p.post}`] = p;
-        setMapRisk(byKey);
-      })
-      .catch(() => {});
-    return () => { alive = false; };
-  }, [stations.length]);
 
   const maxQ95 = forecastMapped.length > 0 ? Math.max(...forecastMapped.map(d => d.q95)) : 0;
   const minForecastMedian = forecastMapped.length > 0
@@ -752,6 +660,7 @@ export default function App() {
             <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Режим работы</label>
             <div className="flex flex-col gap-1">
               {[
+                { id: 'atlas', label: 'Атлас', icon: Map },
                 { id: 'short', label: 'Краткий (1–7 дн)', icon: Activity },
                 { id: 'medium', label: 'Средний (14–30 дн)', icon: Calendar },
                 { id: 'season', label: 'Сезонный', icon: Snowflake },
@@ -924,6 +833,7 @@ export default function App() {
       <main className="flex-1 flex flex-col h-full overflow-hidden bg-slate-50/50">
         <header className="h-16 bg-white border-b border-slate-200 flex items-center px-8 justify-between shrink-0">
           <h2 className="text-lg font-semibold text-slate-800">
+            {mode === 'atlas' && 'Атлас гидрологической обстановки'}
             {mode === 'short' && 'Краткосрочный прогноз (1–7 дней)'}
             {mode === 'medium' && 'Среднесрочный прогноз (14–30 дней)'}
             {mode === 'season' && 'Сезонный прогноз (весенний паводок)'}
@@ -931,11 +841,12 @@ export default function App() {
             {mode === 'norm' && 'Климатическая норма'}
             {mode === 'dashboards' && 'Сводные аналитические дашборды'}
             {mode === 'scenario' && 'Комната сценариев (what-if, 30 дней)'}
+            {mode === 'agent' && 'Агент (админ)'}
             {mode === 'data' && 'Каталог данных и ретрейн моделей'}
           </h2>
           <div className="flex items-center gap-3">
             <AgentAlertsBadge />
-            {isMock && mode !== 'dashboards' && mode !== 'data' && mode !== 'norm' && (
+            {isMock && mode !== 'atlas' && mode !== 'dashboards' && mode !== 'data' && mode !== 'norm' && mode !== 'agent' && (
               <span className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded-lg border border-amber-200">Демо / нет модели</span>
             )}
             {trainingStatus.status === 'training' && (
@@ -978,11 +889,24 @@ export default function App() {
           </div>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-8">
+        <div className={`flex-1 overflow-y-auto ${mode === 'atlas' ? 'p-4' : 'p-8'}`}>
+          {mode === 'atlas' ? (
+            <div className="h-full min-h-[calc(100vh-5rem)]">
+              <AtlasMap
+                stations={stations}
+                selectedLabel={station}
+                onSelectStation={setStation}
+                onOpenForecast={(label, m) => {
+                  setStation(label);
+                  setMode(m === 'medium' ? 'medium' : 'short');
+                }}
+              />
+            </div>
+          ) : (
           <div className="max-w-7xl mx-auto space-y-6">
             
             {/* Natural Language Summary Card */}
-            {(mode !== 'dashboards' && mode !== 'data' && mode !== 'norm') && (
+            {(mode !== 'atlas' && mode !== 'dashboards' && mode !== 'data' && mode !== 'norm' && mode !== 'agent' && mode !== 'scenario') && (
               <div className="bg-white rounded-2xl p-6 shadow-sm border border-slate-200">
                 <div className="flex gap-4">
                   <div className={`p-3 rounded-xl shrink-0 ${maxQ95 >= dangerLevel ? 'bg-red-50 text-red-600' : maxQ95 >= warningLevel ? 'bg-orange-50 text-orange-600' : 'bg-emerald-50 text-emerald-600'}`}>
@@ -1556,99 +1480,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Map Section */}
-            {mode !== 'data' && (
-              <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm mt-6">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 gap-4">
-                  <h3 className="text-base font-semibold text-slate-800 flex items-center gap-2">
-                    <Map className="w-5 h-5 text-blue-500" />
-                    Карта гидрологической обстановки
-                  </h3>
-                  <div className="flex flex-wrap items-center gap-3">
-                    <select 
-                      value={mapData} 
-                      onChange={(e) => setMapData(e.target.value as any)}
-                      className="text-xs border border-slate-200 rounded-lg px-2 py-1.5 outline-none text-slate-700 bg-slate-50 font-medium cursor-pointer"
-                    >
-                      <option value="risk">Карта безопасности (риск)</option>
-                    </select>
-                    {currentStation && (
-                    <button
-                      type="button"
-                      onClick={() => centerOnRiver(currentStation.river)}
-                      className="text-xs px-3 py-1.5 rounded-lg font-medium border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100 transition-colors flex items-center gap-1.5"
-                    >
-                      <Crosshair className="w-3.5 h-3.5 text-blue-500" />
-                      Центрировать: {currentStation.river}
-                    </button>
-                    )}
-                  </div>
-                </div>
-                <div className="h-[400px] w-full rounded-xl overflow-hidden border border-slate-200 z-0 relative bg-slate-900">
-                  <MapGL
-                    longitude={mapCenter[1]}
-                    latitude={mapCenter[0]}
-                    zoom={mapZoom}
-                    mapStyle={SATELLITE_STYLE}
-                    onMove={(e: ViewStateChangeEvent) => {
-                      const { latitude, longitude, zoom } = e.viewState;
-                      setMapCenter([latitude, longitude]);
-                      setMapZoom(zoom);
-                    }}
-                    attributionControl={false}
-                  >
-                    {stations.map(s => {
-                      let fillColor = '';
-                      let dataValue = '';
-                      let labelObj = '';
-                      
-                      // Карта безопасности: цвет/подпись по risk_class из agent_snapshots (/api/map/latest).
-                      // Фейковые температурный/снежный режимы удалены — реальных наблюдений на карте нет.
-                      const mr = mapRisk[`${s.river}|${s.post}`];
-                      const rk = mr?.risk_class || s.risk || 'low';
-                      fillColor = (rk === 'critical' || rk === 'high') ? '#ef4444'
-                        : (rk === 'medium' || rk === 'moderate') ? '#f97316' : '#10b981';
-                      dataValue = (rk === 'critical' || rk === 'high') ? 'Критическая (ОЯ)'
-                        : (rk === 'medium' || rk === 'moderate') ? 'Повышенная (НЯ)' : 'Низкая (норма)';
-                      labelObj = 'Риск:';
-
-                      const markColor = mapStyle === 'satellite' ? 'rgba(255,255,255,0.8)' : 'white';
-                      const isSelected = s.label === station;
-
-                      return (
-                        <Marker key={s.label} longitude={s.lng} latitude={s.lat} anchor="center">
-                          <div className="relative group cursor-pointer" onClick={() => setStation(s.label)}>
-                            <div 
-                              className={`rounded-full shadow-md transition-all ${isSelected ? 'w-6 h-6 relative z-10' : 'w-4 h-4'}`}
-                              style={{ 
-                                backgroundColor: fillColor,
-                                opacity: mapStyle === 'satellite' ? 0.9 : 0.8,
-                                border: `${isSelected ? '3px' : '1px'} solid ${isSelected ? '#3b82f6' : markColor}` 
-                              }} 
-                            />
-                            <div className="absolute top-1/2 left-full ml-3 -translate-y-1/2 bg-white px-3 py-2 rounded-lg shadow-xl border border-slate-200 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 whitespace-nowrap">
-                              <div className="text-sm font-semibold text-slate-800">{s.label}</div>
-                              <div className="text-xs text-slate-600 mt-1">{labelObj} <strong>{dataValue}</strong></div>
-                              {mr?.verdict && (
-                                <div className="text-xs text-slate-500 mt-0.5">
-                                  Вердикт: {mr.verdict.level_ru || mr.verdict.level || '—'}
-                                  {mr.verdict.confidence != null ? ` · ${Math.round((mr.verdict.confidence || 0) * 100)}%` : ''}
-                                </div>
-                              )}
-                              {mr?.forecast_peak?.level_cm != null && (
-                                <div className="text-xs text-slate-500 mt-0.5">
-                                  Пик: {mr.forecast_peak.level_cm} см{mr.forecast_peak.date ? ` @ ${mr.forecast_peak.date}` : ''}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </Marker>
-                      );
-                    })}
-                  </MapGL>
-                </div>
-              </div>
-            )}
 
             {mode === 'scenario' && (
               <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -1954,6 +1785,7 @@ export default function App() {
             )}
 
           </div>
+          )}
         </div>
       </main>
 

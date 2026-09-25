@@ -39,8 +39,66 @@ def safe_float(val):
     except Exception:
         return np.nan
 
+
+def parse_snow_pct(val):
+    """Парсер «% от нормы» из CSV снегозапасов.
+
+    CSV часто хранит диапазоны/операторы, не числа:
+      110-130 → 120 (середина)
+      <70     → 60
+      >130    → 145
+      >200    → 220
+      - / #н/д / пусто → NaN
+      100 / 80 → float as-is
+    """
+    import re
+    if val is None:
+        return np.nan
+    try:
+        if pd.isna(val):
+            return np.nan
+    except Exception:
+        pass
+    s = str(val).strip()
+    if not s:
+        return np.nan
+    s = (
+        s.replace(',', '.')
+        .replace('−', '-')
+        .replace('–', '-')
+        .replace('—', '-')
+        .replace(' ', '')
+    )
+    low = s.lower()
+    if low in ('-', '*', '#н/д', '#н/д.', 'н/д', 'nan', 'none', 'null', '.'):
+        return np.nan
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    m = re.match(r'^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$', s)
+    if m:
+        return (float(m.group(1)) + float(m.group(2))) / 2.0
+    m = re.match(r'^<(\d+(?:\.\d+)?)$', s)
+    if m:
+        bound = float(m.group(1))
+        if abs(bound - 70.0) < 1e-9:
+            return 60.0
+        return round(0.85 * bound, 2)
+    m = re.match(r'^>(\d+(?:\.\d+)?)$', s)
+    if m:
+        bound = float(m.group(1))
+        if abs(bound - 130.0) < 1e-9:
+            return 145.0
+        if abs(bound - 200.0) < 1e-9:
+            return 220.0
+        return round(bound * 1.1, 2)
+    return np.nan
+
+
 def print_step(msg):
     print(f"\n[STEP] {msg}...")
+
 
 def prepare_data(river_filter=None, stats_only=False):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -192,7 +250,8 @@ def prepare_data(river_filter=None, stats_only=False):
     }, inplace=True)
     snow_df['date'] = pd.to_datetime(snow_df[['year', 'month', 'day']], errors='coerce')
     snow_df.dropna(subset=['date'], inplace=True)
-    snow_df['snow_pct_norm'] = snow_df['snow_pct_norm'].apply(safe_float)
+    snow_df['snow_pct_norm'] = snow_df['snow_pct_norm'].apply(parse_snow_pct)
+
     snow_daily = snow_df.groupby(['river_basin', 'date']).agg({'snow_pct_norm': 'mean'}).reset_index()
 
     # 4b. Толщина льда
