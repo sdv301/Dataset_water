@@ -279,28 +279,30 @@ def _run_all(horizon: int) -> Dict[str, Any]:
     with _state_lock:
         _state["running"] = True
         _state["last_run_started"] = started.isoformat(timespec="seconds") + "Z"
-    stations = _list_stations()
-    logger.info("Планировщик агента: старт прогона по %d станциям", len(stations))
-    for i, (river, post) in enumerate(stations, 1):
-        try:
-            res = assess_flood_risk(river, post, horizon=horizon, persist=True)
-            save_snapshot(river, post, res, horizon)
-            ok += 1
-        except Exception as exc:  # noqa: BLE001
-            err.append({"river": river, "post": post, "error": str(exc)[:200]})
-        if i % 5 == 0:
-            gc.collect()
-    gc.collect()
-    finished = _dt.datetime.utcnow()
-    stats = {"ok": ok, "err": len(err),
-             "took_s": int((finished - started).total_seconds()),
-             "errors": err[:20]}
-    with _state_lock:
-        _state["running"] = False
-        _state["last_run_finished"] = finished.isoformat(timespec="seconds") + "Z"
-        _state["last_run_stats"] = stats
-    logger.info("Планировщик агента: готово ok=%d err=%d за %ds",
-                ok, len(err), stats["took_s"])
+    try:
+        stations = _list_stations()
+        logger.info("Планировщик агента: старт прогона по %d станциям", len(stations))
+        for i, (river, post) in enumerate(stations, 1):
+            try:
+                res = assess_flood_risk(river, post, horizon=horizon, persist=True)
+                save_snapshot(river, post, res, horizon)
+                ok += 1
+            except Exception as exc:  # noqa: BLE001
+                err.append({"river": river, "post": post, "error": str(exc)[:200]})
+            if i % 5 == 0:
+                gc.collect()
+        gc.collect()
+    finally:
+        finished = _dt.datetime.utcnow()
+        stats = {"ok": ok, "err": len(err),
+                 "took_s": int((finished - started).total_seconds()),
+                 "errors": err[:20]}
+        with _state_lock:
+            _state["running"] = False
+            _state["last_run_finished"] = finished.isoformat(timespec="seconds") + "Z"
+            _state["last_run_stats"] = stats
+        logger.info("Планировщик агента: готово ok=%d err=%d за %ds",
+                    ok, len(err), stats["took_s"])
     return stats
 
 

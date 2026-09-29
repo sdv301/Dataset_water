@@ -280,12 +280,17 @@ def forecast_points_from_predictor(
                     pd = apply_isotonic_calibration(float(pd), river, post, horizon=use_h, level="crit")
                 except Exception:
                     pass
+        q10_raw = res.get("q10")
+        q90_raw = res.get("q90")
+        q95_raw = res.get("q95")
+        q90_synthetic = q90_raw is None
         points.append({
             "date": target.isoformat(),
             "median": round(median, 2),
-            "q10": round(float(res.get("q10", median * 0.85)), 2),
-            "q90": round(float(res.get("q90", median * 1.15)), 2),
-            "q95": round(float(res.get("q95", median * 1.2)), 2),
+            "q10": round(float(q10_raw if q10_raw is not None else median * 0.85), 2),
+            "q90": round(float(q90_raw if q90_raw is not None else median * 1.15), 2),
+            "q95": round(float(q95_raw if q95_raw is not None else median * 1.2), 2),
+            "q90_synthetic": q90_synthetic,
             "horizon_used": use_h,
             "prob_warning": pw,
             "prob_danger": pd,

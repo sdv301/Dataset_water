@@ -444,12 +444,14 @@ def _forecast_daily(
             q10 = c.get("hist_q10")
             q90 = c.get("hist_q90")
             q95 = c.get("hist_max")
+            q90_synthetic = q90 is None
             pts.append({
                 "date": d.isoformat(),
                 "median": round(float(med), 2),
                 "q10": round(float(q10), 2) if q10 is not None else round(float(med) * 0.85, 2),
                 "q90": round(float(q90), 2) if q90 is not None else round(float(med) * 1.15, 2),
                 "q95": round(float(q95), 2) if q95 is not None else None,
+                "q90_synthetic": q90_synthetic,
                 "horizon_used": i + 1,
                 "prob_warning": _clim_prob(med, q90, q95, low_f),
                 "prob_danger": _clim_prob(med, q90, q95, crit_f),
@@ -468,19 +470,21 @@ def _peak_of(points: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[st
 
 
 def _critical_days(points: List[Dict[str, Any]], low: Optional[float], crit: Optional[float]) -> List[Dict[str, Any]]:
-    """Дни, где прогнозная медиана/верхний квантиль превышает ОЯ/НЯ."""
+    """Дни, где прогнозная медиана или q90 превышает ОЯ/НЯ."""
     out: List[Dict[str, Any]] = []
     for p in points:
         med = p.get("median")
-        q95 = p.get("q95") or p.get("q90") or med
+        q90 = p.get("q90")
+        # Используем q90 (или медиану, если квантили синтетические) для консистентности с вердиктом
+        q_eval = med if p.get("q90_synthetic") else (q90 or med)
         if med is None:
             continue
         level = "watch"
         reached = None
-        if crit is not None and (med >= crit or (q95 is not None and q95 >= crit)):
+        if crit is not None and (med >= crit or (q_eval is not None and q_eval >= crit)):
             level = "critical"
             reached = "critical_oya"
-        elif low is not None and (med >= low or (q95 is not None and q95 >= low)):
+        elif low is not None and (med >= low or (q_eval is not None and q_eval >= low)):
             level = "warning"
             reached = "low_oya"
         else:
@@ -488,7 +492,8 @@ def _critical_days(points: List[Dict[str, Any]], low: Optional[float], crit: Opt
         out.append({
             "date": p.get("date"),
             "median": med,
-            "q95": q95,
+            "q90": q90,
+            "q95": p.get("q95"),
             "level": level,
             "reached": reached,
             "prob_warning": p.get("prob_warning"),
@@ -576,7 +581,8 @@ def assess_flood_risk(
 
     # --- Свежесть данных (data_through + штраф уверенности) ---
     data_through = hs.get_latest_data_date(river, post)
-    today = datetime.date.today()
+    # Используем локальное гидрологическое время поста (Asia/Yakutsk = UTC+9)
+    today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)).date()
     data_lag_days = (today - data_through).days if data_through else None
     stale_penalty = 0.0
     stale_warning: Optional[str] = None
@@ -616,15 +622,26 @@ def assess_flood_risk(
     except Exception:
         _wf_thr, _red_thr = 0.7, 0.7
 
+    valid_q90_pts = [p for p in forecast_points if not p.get("q90_synthetic") and p.get("q90") is not None]
+    is_q90_synthetic = len(valid_q90_pts) == 0
+
+    if not is_q90_synthetic:
+        eval_points = valid_q90_pts
+        q_field = "q90"
+    else:
+        # При отсутствии обученных квантилей вердикт строится честно по медиане
+        eval_points = forecast_points
+        q_field = "median"
+
     days_q90_over_low = sum(
-        1 for p_pt in forecast_points
-        if low is not None and p_pt.get("q90") is not None and p_pt.get("q90") >= low
+        1 for p_pt in eval_points
+        if low is not None and p_pt.get(q_field) is not None and p_pt.get(q_field) >= low
     )
     days_q90_over_crit = sum(
-        1 for p_pt in forecast_points
-        if crit is not None and p_pt.get("q90") is not None and p_pt.get("q90") >= crit
+        1 for p_pt in eval_points
+        if crit is not None and p_pt.get(q_field) is not None and p_pt.get(q_field) >= crit
     )
-    horizon_len = max(1, len(forecast_points))
+    horizon_len = max(1, len(eval_points))
     p_exceed_low = (days_q90_over_low / horizon_len) if low is not None else None
     p_exceed_crit = (days_q90_over_crit / horizon_len) if crit is not None else None
 
@@ -643,13 +660,19 @@ def assess_flood_risk(
         _conf_cands.append(prob_dang)
     if prob_warn is not None:
         _conf_cands.append((prob_warn or 0) * 0.9)
+    base_conf = max(_conf_cands) if _conf_cands else 0.0
+    if is_q90_synthetic:
+        base_conf = max(0.0, base_conf - 0.15)
     verdict_confidence = round(
-        max(0.0, min(1.0, (max(_conf_cands) if _conf_cands else 0.0) - stale_penalty)), 3)
+        max(0.0, min(1.0, base_conf - stale_penalty)), 3)
     verdict_reason_parts: List[str] = []
+    val_label = "медиана" if is_q90_synthetic else "q90"
     if p_exceed_crit is not None and p_exceed_crit >= 0.5:
-        verdict_reason_parts.append(f"q90 ≥ ОЯ в {days_q90_over_crit} из {horizon_len} дней")
+        verdict_reason_parts.append(f"{val_label} ≥ ОЯ в {days_q90_over_crit} из {horizon_len} дней")
     if p_exceed_low is not None and p_exceed_low >= 0.5:
-        verdict_reason_parts.append(f"q90 ≥ НЯ в {days_q90_over_low} из {horizon_len} дней")
+        verdict_reason_parts.append(f"{val_label} ≥ НЯ в {days_q90_over_low} из {horizon_len} дней")
+    if is_q90_synthetic:
+        verdict_reason_parts.append("квантили синтетические (оценка по медиане)")
     if drivers:
         verdict_reason_parts.append(f"сработало правил: {len(drivers)}")
     if not verdict_reason_parts:
@@ -665,13 +688,14 @@ def assess_flood_risk(
         "p_exceed_crit": round(p_exceed_crit, 3) if p_exceed_crit is not None else None,
         "will_flood_threshold": _wf_thr,
         "verdict_red_threshold": _red_thr,
+        "q90_synthetic": is_q90_synthetic,
         "reason": "; ".join(verdict_reason_parts),
     }
 
     scenarios = {
-        "optimistic":  {"peak_cm": peak_q10,     "date": peak_q10_date,     "quantile": "q10"},
-        "median":      {"peak_cm": peak_median,  "date": peak_date,         "quantile": "q50"},
-        "pessimistic": {"peak_cm": peak_q90,     "date": peak_q90_date,     "quantile": "q90"},
+        "optimistic":  {"peak_cm": peak_q10,     "date": peak_q10_date,     "quantile": "q10", "synthetic": is_q90_synthetic},
+        "median":      {"peak_cm": peak_median,  "date": peak_date,         "quantile": "q50", "synthetic": False},
+        "pessimistic": {"peak_cm": peak_q90,     "date": peak_q90_date,     "quantile": "q90", "synthetic": is_q90_synthetic},
     }
 
     oya_score = _oya_pressure_score(peak_median, low, crit)
@@ -749,7 +773,7 @@ def assess_flood_risk(
             "prob_danger": prob_dang,
         },
         "forecast_daily": [
-            {k: p.get(k) for k in ("date", "median", "q10", "q90", "q95", "prob_warning", "prob_danger")}
+            {k: p.get(k) for k in ("date", "median", "q10", "q90", "q95", "q90_synthetic", "prob_warning", "prob_danger")}
             for p in forecast_points
         ],
         "critical_days": critical_days,

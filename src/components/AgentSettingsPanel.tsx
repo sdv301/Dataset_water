@@ -1,6 +1,17 @@
 import React from 'react';
 import { API_BASE } from '../config';
 
+function formatLocalTime(isoStr?: string | null): string {
+  if (!isoStr) return '-';
+  try {
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return isoStr;
+    return d.toLocaleString('ru-RU', { timeZone: 'Asia/Yakutsk', dateStyle: 'short', timeStyle: 'short' }) + ' (Якт)';
+  } catch {
+    return isoStr;
+  }
+}
+
 export function AgentSettingsPanel() {
   const [st, setSt] = React.useState<any>(null);
   const [sc, setSc] = React.useState<any>(null);
@@ -58,8 +69,8 @@ export function AgentSettingsPanel() {
           <div>Horizon: {st.horizon} days</div>
           <div>will_flood thr: {st.will_flood_threshold ?? '-'}</div>
           <div>red thr: {st.verdict_red_threshold ?? '-'}</div>
-          <div>Next run: {st.next_run || '-'}</div>
-          <div>Last run: {st.last_run_finished || '-'}</div>
+          <div>Next run: {formatLocalTime(st.next_run)}</div>
+          <div>Last run: {formatLocalTime(st.last_run_finished)}</div>
           <div>Snapshots: {st.snapshot_stats?.total ?? st.snapshot_stats?.count ?? '-'}</div>
         </div>
         <div className="border-t pt-4 space-y-3">

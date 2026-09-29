@@ -24,27 +24,29 @@ interface CritDay { date: string; level: 'warning' | 'critical'; median: number;
 interface Driver { id: string; label: string; feature: string; value: number; threshold: number; weight: number; score: number; note?: string }
 interface Verdict {
   will_flood: boolean;
-  level: 'green' | 'yellow' | 'red';
+  level: 'green' | 'yellow' | 'red' | 'unknown';
   level_ru: string;
   confidence: number;
-  p_exceed_low: number;
-  p_exceed_crit: number;
+  p_exceed_low: number | null;
+  p_exceed_crit: number | null;
   reason: string;
+  q90_synthetic?: boolean;
 }
-interface Scenario { peak_cm: number | null; date: string | null; quantile: string }
+interface Scenario { peak_cm: number | null; date: string | null; quantile: string; synthetic?: boolean }
 interface AgentResult {
   risk_score: number;
   risk_class: 'low' | 'moderate' | 'high' | 'critical';
   risk_class_ru: string;
   has_model: boolean;
   observation_date: string;
+  assessed_at?: string;
   horizon_days: number;
   data_through?: string | null;
   data_lag_days?: number | null;
   stale_warning?: string | null;
-  thresholds: { low_oya: number; critical_oya: number };
+  thresholds: { low_oya: number | null; critical_oya: number | null };
   forecast_peak: { level_cm: number | null; date: string | null; prob_warning: number | null; prob_danger: number | null };
-  forecast_daily: Array<{ date: string; median: number; q10?: number; q90?: number; q95?: number }>;
+  forecast_daily: Array<{ date: string; median: number; q10?: number; q90?: number; q95?: number; q90_synthetic?: boolean }>;
   critical_days: CritDay[];
   drivers: Driver[];
   verdict?: Verdict;
@@ -169,9 +171,8 @@ export function FloodAgentPanel({ river, post, horizon = 14 }: Props) {
 
   const cls = CLASS_COLORS[data.risk_class] || CLASS_COLORS.low;
   const peak = data.forecast_peak;
-  const dailyMax = data.forecast_daily.length
-    ? Math.max(...data.forecast_daily.map(d => d.q95 ?? d.median ?? 0), data.thresholds.critical_oya)
-    : data.thresholds.critical_oya;
+  const lowOya = data.thresholds?.low_oya != null ? Number(data.thresholds.low_oya) : null;
+  const critOya = data.thresholds?.critical_oya != null ? Number(data.thresholds.critical_oya) : null;
 
   return (
     <div className={`bg-white rounded-2xl p-6 border shadow-sm space-y-5 ring-1 ${cls.ring}`}>
@@ -193,7 +194,12 @@ export function FloodAgentPanel({ river, post, horizon = 14 }: Props) {
           </div>
         </div>
         <div className="text-xs text-slate-400 text-right">
-          Оценка от {data.observation_date}
+          <div>Данные на <span className="font-medium text-slate-600">{data.observation_date}</span></div>
+          {data.assessed_at && (
+            <div className="text-[11px] text-slate-400">
+              Оценка: {new Date(data.assessed_at).toLocaleString('ru-RU', { timeZone: 'Asia/Yakutsk', dateStyle: 'short', timeStyle: 'short' })} (Якт)
+            </div>
+          )}
           <div>{data.has_model ? 'ML+правила' : 'только правила'}</div>
           {data.data_through && (
             <div className={data.data_lag_days != null && data.data_lag_days > 7 ? 'text-amber-600 font-medium' : ''}>
@@ -229,19 +235,29 @@ export function FloodAgentPanel({ river, post, horizon = 14 }: Props) {
         <div className={`rounded-xl p-4 border-2 ${
           data.verdict.level === 'red'    ? 'bg-red-50 border-red-300' :
           data.verdict.level === 'yellow' ? 'bg-amber-50 border-amber-300' :
-                                            'bg-emerald-50 border-emerald-300'
+          data.verdict.level === 'green'  ? 'bg-emerald-50 border-emerald-300' :
+                                            'bg-slate-50 border-slate-300'
         }`}>
           <div className="flex items-center justify-between gap-4 flex-wrap">
             <div>
-              <div className="text-xs uppercase tracking-wide text-slate-500">Вердикт агента</div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs uppercase tracking-wide text-slate-500">Вердикт агента</span>
+                {data.verdict.q90_synthetic && (
+                  <span className="text-[10px] bg-slate-200 text-slate-600 px-1.5 py-0.5 rounded font-normal">
+                    квантили синт.
+                  </span>
+                )}
+              </div>
               <div className={`text-xl font-bold ${
-                data.verdict.level === 'red'    ? 'text-red-700' :
-                data.verdict.level === 'yellow' ? 'text-amber-700' :
-                                                  'text-emerald-700'
+                data.verdict.level === 'red'     ? 'text-red-700' :
+                data.verdict.level === 'yellow'  ? 'text-amber-700' :
+                data.verdict.level === 'green'   ? 'text-emerald-700' :
+                                                   'text-slate-700'
               }`}>
-                {data.verdict.level === 'red'    && '⚠️ Паводок ожидается'}
-                {data.verdict.level === 'yellow' && '⚡ Паводок возможен'}
-                {data.verdict.level === 'green'  && '✅ Паводок не ожидается'}
+                {data.verdict.level === 'red'     && '⚠️ Паводок ожидается'}
+                {data.verdict.level === 'yellow'  && '⚡ Паводок возможен'}
+                {data.verdict.level === 'green'   && '✅ Паводок не ожидается'}
+                {data.verdict.level === 'unknown' && '❓ Риск не определён'}
               </div>
               <div className="text-xs text-slate-600 mt-1">{data.verdict.reason}</div>
             </div>
@@ -249,7 +265,9 @@ export function FloodAgentPanel({ river, post, horizon = 14 }: Props) {
               <div className="text-xs text-slate-500">Уверенность</div>
               <div className="text-2xl font-bold text-slate-800">{Math.round(data.verdict.confidence * 100)}%</div>
               <div className="text-[11px] text-slate-500">
-                P(≥НЯ)={Math.round(data.verdict.p_exceed_low*100)}% · P(≥ОЯ)={Math.round(data.verdict.p_exceed_crit*100)}%
+                {data.verdict.p_exceed_low != null ? `Дней ≥ НЯ: ${Math.round(data.verdict.p_exceed_low * 100)}%` : 'НЯ не задан'}
+                {' · '}
+                {data.verdict.p_exceed_crit != null ? `Дней ≥ ОЯ: ${Math.round(data.verdict.p_exceed_crit * 100)}%` : 'ОЯ не задан'}
               </div>
             </div>
           </div>
@@ -260,7 +278,10 @@ export function FloodAgentPanel({ river, post, horizon = 14 }: Props) {
                 const label = k === 'optimistic' ? 'Оптим. (q10)' : k === 'median' ? 'Медиан. (q50)' : 'Пессим. (q90)';
                 return (
                   <div key={k} className="bg-white/60 rounded-lg p-2 text-center">
-                    <div className="text-[10px] uppercase text-slate-500">{label}</div>
+                    <div className="text-[10px] uppercase text-slate-500 flex items-center justify-center gap-1">
+                      {label}
+                      {s.synthetic && <span className="text-[9px] text-slate-400">(синт.)</span>}
+                    </div>
                     <div className="text-lg font-semibold text-slate-800">
                       {s.peak_cm != null ? `${Math.round(s.peak_cm)} см` : '—'}
                     </div>
@@ -324,7 +345,7 @@ export function FloodAgentPanel({ river, post, horizon = 14 }: Props) {
         <div className="bg-slate-50 rounded-xl p-4">
           <div className="text-xs text-slate-500 mb-1">ОЯ (низкий / критический)</div>
           <div className="text-lg font-semibold text-slate-700">
-            {Math.round(data.thresholds.low_oya)} / {Math.round(data.thresholds.critical_oya)} см
+            {lowOya != null ? Math.round(lowOya) : '—'} / {critOya != null ? Math.round(critOya) : '—'} см
           </div>
         </div>
         <div className="bg-slate-50 rounded-xl p-4">
@@ -432,21 +453,23 @@ function ForecastSvg({
   daily, low, crit,
 }: {
   daily: Array<{ date: string; median: number; q10?: number; q90?: number }>;
-  low: number; crit: number;
+  low: number | null; crit: number | null;
 }) {
   const W = 640, H = 180, PAD_L = 42, PAD_R = 8, PAD_T = 10, PAD_B = 26;
   const n = daily.length;
   if (n === 0) return null;
 
+  const todayIso = new Date().toISOString().slice(0, 10);
   const values: number[] = [];
   daily.forEach(d => {
     if (d.median != null) values.push(d.median);
     if (d.q10 != null) values.push(d.q10);
     if (d.q90 != null) values.push(d.q90);
   });
-  values.push(low, crit);
-  const vmin = Math.min(...values);
-  const vmax = Math.max(...values);
+  if (low != null) values.push(low);
+  if (crit != null) values.push(crit);
+  const vmin = values.length ? Math.min(...values) : 0;
+  const vmax = values.length ? Math.max(...values) : 100;
   const span = Math.max(1, vmax - vmin);
   const yMin = vmin - span * 0.05;
   const yMax = vmax + span * 0.05;
@@ -474,22 +497,42 @@ function ForecastSvg({
             <text x={4} y={y(v) + 4} fontSize={10} fill="#64748b">{Math.round(v)}</text>
           </g>
         ))}
-        <line x1={PAD_L} x2={W - PAD_R} y1={y(low)} y2={y(low)} stroke="#f59e0b" strokeDasharray="4 3" strokeWidth={1.5} />
-        <text x={W - PAD_R} y={y(low) - 3} fontSize={10} fill="#b45309" textAnchor="end">НЯ {Math.round(low)}</text>
-        <line x1={PAD_L} x2={W - PAD_R} y1={y(crit)} y2={y(crit)} stroke="#dc2626" strokeDasharray="4 3" strokeWidth={1.5} />
-        <text x={W - PAD_R} y={y(crit) - 3} fontSize={10} fill="#991b1b" textAnchor="end">ОЯ {Math.round(crit)}</text>
+        {low != null && (
+          <g>
+            <line x1={PAD_L} x2={W - PAD_R} y1={y(low)} y2={y(low)} stroke="#f59e0b" strokeDasharray="4 3" strokeWidth={1.5} />
+            <text x={W - PAD_R} y={y(low) - 3} fontSize={10} fill="#b45309" textAnchor="end">НЯ {Math.round(low)}</text>
+          </g>
+        )}
+        {crit != null && (
+          <g>
+            <line x1={PAD_L} x2={W - PAD_R} y1={y(crit)} y2={y(crit)} stroke="#dc2626" strokeDasharray="4 3" strokeWidth={1.5} />
+            <text x={W - PAD_R} y={y(crit) - 3} fontSize={10} fill="#991b1b" textAnchor="end">ОЯ {Math.round(crit)}</text>
+          </g>
+        )}
         <path d={bandPath} fill="#3b82f6" fillOpacity={0.15} stroke="none" />
         <path d={medianPath} fill="none" stroke="#2563eb" strokeWidth={2} />
-        {daily.map((d, i) => (
-          <g key={d.date}>
-            <circle cx={x(i)} cy={y(d.median)} r={2.5}
-                    fill={d.median >= crit ? '#dc2626' : d.median >= low ? '#f59e0b' : '#2563eb'} />
-            {(i === 0 || i === n - 1 || i % Math.max(1, Math.ceil(n / 8)) === 0) && (
-              <text x={x(i)} y={H - 8} fontSize={10} fill="#64748b" textAnchor="middle">{d.date.slice(5)}</text>
-            )}
-            <title>{`${d.date}: ${Math.round(d.median)} см${d.q10 != null && d.q90 != null ? ` (q10..q90: ${Math.round(d.q10)}..${Math.round(d.q90)})` : ''}`}</title>
-          </g>
-        ))}
+        {daily.map((d, i) => {
+          const isToday = d.date === todayIso;
+          const isCrit = crit != null && d.median >= crit;
+          const isLow = low != null && d.median >= low;
+          return (
+            <g key={d.date}>
+              {isToday && (
+                <line x1={x(i)} x2={x(i)} y1={PAD_T} y2={H - PAD_B} stroke="#6366f1" strokeDasharray="2 2" strokeWidth={1.5} />
+              )}
+              <circle cx={x(i)} cy={y(d.median)} r={isToday ? 3.5 : 2.5}
+                      fill={isCrit ? '#dc2626' : isLow ? '#f59e0b' : '#2563eb'}
+                      stroke={isToday ? '#4338ca' : 'none'} strokeWidth={isToday ? 1.5 : 0} />
+              {(i === 0 || i === n - 1 || isToday || i % Math.max(1, Math.ceil(n / 8)) === 0) && (
+                <text x={x(i)} y={H - 8} fontSize={10} fill={isToday ? '#4338ca' : '#64748b'}
+                      fontWeight={isToday ? 700 : 400} textAnchor="middle">
+                  {d.date.slice(5)}{isToday ? ' (сегодня)' : ''}
+                </text>
+              )}
+              <title>{`${d.date}${isToday ? ' [СЕГОДНЯ]' : ''}: ${Math.round(d.median)} см${d.q10 != null && d.q90 != null ? ` (q10..q90: ${Math.round(d.q10)}..${Math.round(d.q90)})` : ''}`}</title>
+            </g>
+          );
+        })}
       </svg>
     </div>
   );
