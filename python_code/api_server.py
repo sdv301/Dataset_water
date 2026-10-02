@@ -149,6 +149,10 @@ class ForecastResponse(BaseModel):
     risk_summary: RiskSummary
     feature_importance: dict[str, float]
     is_mock: bool = False
+    latest_observation_date: Optional[str] = None
+    stale_data_warning: Optional[str] = None
+    forecast_note: Optional[str] = None
+
 
 
 class HistoryPoint(BaseModel):
@@ -165,6 +169,8 @@ class TrainRequest(BaseModel):
     post: Optional[str] = None
     fast: bool = False
     backend: str = "catboost"
+    force: bool = True
+
 
 
 class TrainStarted(BaseModel):
@@ -318,7 +324,9 @@ def _run_training(
     fast: bool,
     task_id: str,
     backend: str = "catboost",
+    force: bool = True,
 ) -> None:
+
     """
     Запускает обучение в фоновом потоке.
     Обновляет глобальный training_status и пишет историю в БД.
@@ -1439,7 +1447,11 @@ async def get_forecast(
         risk_summary=risk_summary,
         feature_importance=fi,
         is_mock=tier_data["is_mock"],
+        latest_observation_date=tier_data.get("latest_observation_date"),
+        stale_data_warning=tier_data.get("stale_data_warning"),
+        forecast_note=tier_data.get("forecast_note"),
     )
+
 
 
 def _tier_response(river: str, post: str, tier: str, days: int, base_date: Optional[str] = None) -> dict:
@@ -1897,9 +1909,10 @@ async def start_training(body: TrainRequest):
 
     thread = threading.Thread(
         target=_run_training,
-        args=(body.river, body.post, body.fast, task_id, train_backend),
+        args=(body.river, body.post, body.fast, task_id, train_backend, body.force),
         daemon=True,
     )
+
     thread.start()
     logger.info("Обучение запущено [task_id=%s].", task_id)
     return TrainStarted(task_id=task_id, status="started")

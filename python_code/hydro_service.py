@@ -1086,6 +1086,11 @@ def tier_forecast(
     low = float(st.get("low_oya") or 500)
     crit = float(st.get("critical_oya") or 650)
     latest = get_latest_data_date(river, post)
+    if isinstance(base_date, str):
+        try:
+            base_date = datetime.date.fromisoformat(base_date)
+        except Exception:
+            base_date = None
     # Если пользователь явно передал base_date — используем его (для анализа прошлого).
     # Иначе: прогноз всегда строится от max(последняя запись, сегодня), чтобы
     # агент прогнозировал будущее, а не повторял последний день из БД.
@@ -1126,6 +1131,14 @@ def tier_forecast(
     tier_horizons = TIER_HORIZONS.get(tier, [])
     trained_h = sorted(int(h) for h in predictor.models.keys()) if predictor else []
     forecast_note = None
+    days_stale = (base_date - latest).days if base_date > latest else 0
+    stale_data_warning = None
+    if days_stale > 2:
+        stale_data_warning = (
+            f"Внимание: последние наблюдения в БД датированы {latest.isoformat()} "
+            f"(задержка {days_stale} дн.). Прогноз экстраполируется от последнего известного состояния."
+        )
+
     if predictor and not points:
         forecast_note = "Не удалось построить прогноз — проверьте модель."
     elif predictor and tier == "medium" and trained_h and not any(h >= 14 for h in trained_h):
@@ -1134,9 +1147,14 @@ def tier_forecast(
             "Для точного прогноза 14–30 дней выполните быстрое или полное обучение."
         )
 
+    if stale_data_warning:
+        forecast_note = f"{forecast_note} | {stale_data_warning}" if forecast_note else stale_data_warning
+
     return {
         "tier": tier,
         "base_date": base_date.isoformat(),
+        "latest_observation_date": latest.isoformat(),
+        "stale_data_warning": stale_data_warning,
         "station": {"river": river, "post": post, "low_oya": low, "critical_oya": crit},
         "forecast": points,
         "risk_summary": risk,
@@ -1146,6 +1164,8 @@ def tier_forecast(
         "trained_horizons": trained_h,
         "forecast_note": forecast_note,
     }
+
+
 
 
 # ---------------------------------------------------------------------------
