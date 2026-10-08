@@ -867,19 +867,39 @@ class _SchedConfigPayload(BaseModel):
     minute: Optional[int] = None
     enabled: Optional[bool] = None
     horizon: Optional[int] = None
+    horizon_days: Optional[int] = None
     will_flood_threshold: Optional[float] = None
     verdict_red_threshold: Optional[float] = None
+    preset: Optional[str] = None
+    station_timeout_seconds: Optional[float] = None
+    station_delay_seconds: Optional[float] = None
+    challenger_enabled: Optional[bool] = None
+    schedule: Optional[Dict[str, Any]] = None
+    thresholds: Optional[Dict[str, Any]] = None
+    safety: Optional[Dict[str, Any]] = None
+    challenger: Optional[Dict[str, Any]] = None
 
 
 @app.post("/api/agent/scheduler/config")
 async def agent_scheduler_config(payload: _SchedConfigPayload):
     import agent_scheduler
     try:
+        hz = payload.horizon_days if payload.horizon_days is not None else payload.horizon
         return agent_scheduler.update_config(
-            hour=payload.hour, minute=payload.minute,
-            enabled=payload.enabled, horizon=payload.horizon,
+            hour=payload.hour,
+            minute=payload.minute,
+            enabled=payload.enabled,
+            horizon=hz,
             will_flood_threshold=payload.will_flood_threshold,
             verdict_red_threshold=payload.verdict_red_threshold,
+            preset=payload.preset,
+            station_timeout_seconds=payload.station_timeout_seconds,
+            station_delay_seconds=payload.station_delay_seconds,
+            challenger_enabled=payload.challenger_enabled,
+            schedule=payload.schedule,
+            thresholds=payload.thresholds,
+            safety=payload.safety,
+            challenger=payload.challenger,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -895,6 +915,11 @@ async def agent_self_check():
 async def agent_config():
     import agent_scheduler
     return agent_scheduler.get_agent_config()
+
+
+@app.post("/api/agent/config")
+async def agent_config_post(payload: _SchedConfigPayload):
+    return await agent_scheduler_config(payload)
 
 
 
@@ -997,6 +1022,7 @@ class _FeedbackPayload(BaseModel):
     alert_id: Optional[int] = None
     actual_class: Optional[str] = None
     comment: Optional[str] = None
+    rule_ids: Optional[List[str]] = None
 
 
 @app.post("/api/agent/feedback")
@@ -1011,6 +1037,7 @@ async def post_agent_feedback(payload: _FeedbackPayload):
             alert_id=payload.alert_id,
             actual_class=payload.actual_class,
             comment=payload.comment,
+            rule_ids=payload.rule_ids,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1477,6 +1504,45 @@ def _tier_response(river: str, post: str, tier: str, days: int, base_date: Optio
             )
     return data
 
+
+ENABLE_TIMESFM_CHALLENGER = os.environ.get("ENABLE_TIMESFM_CHALLENGER", "false").lower() in ("1", "true", "yes")
+
+
+@app.get("/api/forecast/challenger/{river}/{post}")
+async def get_forecast_challenger(
+    river: str,
+    post: str,
+    days: int = Query(14, ge=1, le=60, description="Горизонт дней для челленджера"),
+    base_date: Optional[str] = Query(None, description="Базовая дата (YYYY-MM-DD)"),
+):
+    """
+    Эндпоинт оффлайн-челленджера TimesFM.
+    Защищён флагом ENABLE_TIMESFM_CHALLENGER=true.
+    """
+    if not ENABLE_TIMESFM_CHALLENGER:
+        return {
+            "enabled": False,
+            "river": river,
+            "post": post,
+            "message": "TimesFM challenger отключен в продакшене для сохранения лимита памяти 2GB/2CPU. Установите ENABLE_TIMESFM_CHALLENGER=true для запуска.",
+        }
+
+    try:
+        from timesfm_challenger import TimesFMChallenger
+        tfm = TimesFMChallenger(db_path=str(_DB_PATH))
+        bd = datetime.date.fromisoformat(base_date) if base_date else datetime.date.today()
+        horizons = [1, 3, 7, 14, 30]
+        horizons = [h for h in horizons if h <= days] or [1, 3, 7]
+        points = tfm.forecast(river, post, bd, horizons=horizons)
+        return {
+            "enabled": True,
+            "river": river,
+            "post": post,
+            "base_date": bd.isoformat(),
+            "challenger_forecast": points,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Challenger error: {e}")
 
 @app.get("/api/forecast/{river}/{post}/short")
 async def get_forecast_short(

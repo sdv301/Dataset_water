@@ -143,39 +143,64 @@ def _bump_rule_weight(
         )
 
 
-# Пороговые правила (можно тюнить per-станция потом).
+# Пороговые правила по гидрологическим режимам (весеннее половодье/заторы, летне-осенние дождевые паводки, всесезонная динамика).
 _RULES: List[Dict[str, Any]] = [
+    # --- Весенний режим (снеготаяние, ледоход, заторы: месяцы 2..5) ---
     {"id": "snow_high", "feature": "snow_pct_norm", "op": ">=", "threshold": 130.0,
-     "score": 25.0, "label": "Аномально большой снегозапас",
+     "score": 18.0, "label": "Аномально большой снегозапас",
      "note": "Снегозапас ≥130% нормы — риск резкого весеннего подъёма.",
-     "season": {3, 4, 5}},
+     "season": {2, 3, 4, 5}},
     {"id": "snow_extreme", "feature": "snow_pct_norm", "op": ">=", "threshold": 160.0,
      "score": 15.0, "label": "Экстремальный снегозапас",
      "note": "Снегозапас ≥160% нормы — исторически коррелирует с крупными паводками.",
-     "season": {3, 4, 5}},
+     "season": {2, 3, 4, 5}},
+    {"id": "winter_precip_high", "feature": "precip_sum_90d", "op": ">=", "threshold": 80.0,
+     "score": 12.0, "label": "Высокие зимние осадки (90 дней)",
+     "note": "Накопление осадков за 90 дней ≥80 мм формирует повышенный весенний сток.",
+     "season": {2, 3, 4, 5}},
     {"id": "ice_thick", "feature": "ice_thickness_cm", "op": ">=", "threshold": 90.0,
-     "score": 15.0, "label": "Толстый лёд",
+     "score": 14.0, "label": "Толстый лёд",
      "note": "Толщина льда ≥90 см — при быстрой оттепели повышенный риск заторов.",
-     "season": {3, 4, 5}},
-    {"id": "summer_rain_30d", "feature": "precip_sum_30d", "op": ">=", "threshold": 120.0,
-     "score": 20.0, "label": "Обильные летние осадки (30 дней)",
-     "note": "Сумма осадков за месяц ≥120 мм — риск дождевого паводка.",
-     "season": {6, 7, 8, 9}},
-    {"id": "summer_rain_7d", "feature": "precip_sum_7d", "op": ">=", "threshold": 50.0,
-     "score": 15.0, "label": "Ливневый эпизод (7 дней)",
-     "note": "Сумма осадков за неделю ≥50 мм — быстрый рост притока.",
-     "season": {6, 7, 8, 9}},
+     "season": {2, 3, 4, 5}},
+    {"id": "ice_extreme", "feature": "ice_thickness_cm", "op": ">=", "threshold": 130.0,
+     "score": 14.0, "label": "Аномальная толщина льда",
+     "note": "Толщина льда ≥130 см — критический риск заторов при вскрытии реки.",
+     "season": {2, 3, 4, 5}},
     {"id": "temp_anom_warm", "feature": "temp_anomaly", "op": ">=", "threshold": 4.0,
      "score": 10.0, "label": "Положительная аномалия температуры",
      "note": "Аномалия ≥+4 °C — ускоряет снеготаяние / вскрытие льда.",
      "season": {3, 4, 5}},
+
+    # --- Летне-осенний режим (дождевые паводки: месяцы 6..10) ---
+    {"id": "summer_rain_7d", "feature": "precip_sum_7d", "op": ">=", "threshold": 50.0,
+     "score": 15.0, "label": "Ливневый эпизод (7 дней)",
+     "note": "Сумма осадков за неделю ≥50 мм — быстрый рост притока.",
+     "season": {6, 7, 8, 9, 10}},
+    {"id": "summer_rain_30d", "feature": "precip_sum_30d", "op": ">=", "threshold": 120.0,
+     "score": 18.0, "label": "Обильные летние осадки (30 дней)",
+     "note": "Сумма осадков за месяц ≥120 мм — риск дождевого паводка.",
+     "season": {6, 7, 8, 9, 10}},
+    {"id": "rain_extreme_60d", "feature": "precip_sum_60d", "op": ">=", "threshold": 200.0,
+     "score": 15.0, "label": "Затяжные дожди (60 дней)",
+     "note": "Сумма осадков за 2 месяца ≥200 мм — переувлажнение речного бассейна.",
+     "season": {6, 7, 8, 9, 10}},
+
+    # --- Всесезонные динамические триггеры уровня ---
     {"id": "level_rise_7d", "feature": "delta_7d", "op": ">=", "threshold": 30.0,
-     "score": 15.0, "label": "Быстрый рост уровня",
+     "score": 12.0, "label": "Быстрый рост уровня",
      "note": "+30 см за неделю — активная фаза подъёма воды.",
      "season": None},
+    {"id": "level_rise_fast", "feature": "delta_7d", "op": ">=", "threshold": 70.0,
+     "score": 15.0, "label": "Резкий подъем уровня (7 дней)",
+     "note": "+70 см за неделю — интенсивный подъем паводковой волны.",
+     "season": None},
     {"id": "level_near_oya", "feature": "level_vs_oya_pct", "op": ">=", "threshold": 85.0,
-     "score": 20.0, "label": "Уровень близко к ОЯ",
+     "score": 18.0, "label": "Уровень близко к ОЯ",
      "note": "Текущий уровень ≥85% от критического ОЯ.",
+     "season": None},
+    {"id": "level_over_low_oya", "feature": "level_vs_oya_pct", "op": ">=", "threshold": 100.0,
+     "score": 22.0, "label": "Превышение опасной отметки ОЯ",
+     "note": "Текущий уровень достиг или превысил 100% критического ОЯ.",
      "season": None},
 ]
 
@@ -195,22 +220,44 @@ def _classify(score: float) -> Tuple[str, str]:
     return en, ru
 
 
-def _data_gaps(features: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Список отсутствующих/подозрительных признаков с человеческой рекомендацией."""
+def _data_gaps(features: Dict[str, Any], month: Optional[int] = None) -> List[Dict[str, str]]:
+    """Список отсутствующих/подозрительных признаков с сезонной привязкой и рекомендацией."""
     gaps: List[Dict[str, str]] = []
+    m = month or features.get("month")
+
+    # Сезонные критические проверки
+    if m in (2, 3, 4, 5):
+        if features.get("snow_pct_norm") is None:
+            gaps.append({
+                "feature": "snow_pct_norm",
+                "label": "Снегозапас (% нормы)",
+                "hint": "Критично весной: загрузите снегомерные наблюдения перед половодьем.",
+                "severity": "high",
+            })
+        if features.get("ice_thickness_cm") is None:
+            gaps.append({
+                "feature": "ice_thickness_cm",
+                "label": "Толщина льда",
+                "hint": "Критично весной: добавьте замеры толщины льда для прогноза заторов.",
+                "severity": "high",
+            })
+    elif m in (6, 7, 8, 9, 10):
+        if features.get("precip_sum_7d") is None or features.get("precip_sum_30d") is None:
+            gaps.append({
+                "feature": "precip_sum_7d",
+                "label": "Суммы осадков (7д / 30д)",
+                "hint": "Критично летом: проверьте непрерывность осадков для прогноза дождевых паводков.",
+                "severity": "high",
+            })
+
     checks = [
-        ("snow_pct_norm",     "Снегозапас (% от нормы)",   "Загрузите снегомерные наблюдения за март–апрель."),
-        ("ice_thickness_cm",  "Толщина льда",              "Добавьте наблюдения толщины льда (см)."),
-        ("temp_anomaly",      "Аномалия температуры",      "Проверьте климатологию температуры на посту."),
-        ("precip_sum_30d",    "Осадки за 30 дней",         "Проверьте, что precip_mm заполнен без пропусков."),
-        ("precip_sum_7d",     "Осадки за 7 дней",          "Проверьте precip_mm за последние 7 дней."),
-        ("delta_7d",          "Дельта уровня за 7 дней",   "Нужны water_level_cm минимум за 8 предыдущих дней."),
-        ("level_vs_oya_pct",  "Уровень относительно ОЯ",   "Заполните low_oya/critical_oya в таблице stations."),
+        ("temp_anomaly", "Аномалия температуры", "Проверьте климатологию температуры на посту.", "medium"),
+        ("delta_7d", "Дельта уровня за 7 дней", "Нужны water_level_cm минимум за 8 предыдущих дней.", "medium"),
+        ("level_vs_oya_pct", "Уровень относительно ОЯ", "Заполните low_oya/critical_oya в таблице stations.", "medium"),
     ]
-    for key, label, hint in checks:
-        v = features.get(key)
-        if v is None:
-            gaps.append({"feature": key, "label": label, "hint": hint, "severity": "missing"})
+    for key, label, hint, sev in checks:
+        if features.get(key) is None:
+            gaps.append({"feature": key, "label": label, "hint": hint, "severity": sev})
     return gaps
 
 
@@ -579,7 +626,7 @@ def assess_flood_risk(
     peak_median, peak_date = _peak_of(forecast_points)
     critical_days = _critical_days(forecast_points, low, crit)
 
-    # --- Свежесть данных (data_through + штраф уверенности) ---
+    # --- Свежесть данных и возраст обученной модели ---
     data_through = hs.get_latest_data_date(river, post)
     # Используем локальное гидрологическое время поста (Asia/Yakutsk = UTC+9)
     today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)).date()
@@ -593,6 +640,25 @@ def assess_flood_risk(
             f"Данные устарели на {data_lag_days} дн. (последние: {data_through}). "
             f"Уверенность снижена на {int(round(stale_penalty * 100))}%."
         )
+
+    # Возраст ML-модели станции и дисконтирование уверенности при устаревании >90 дней
+    model_trained_at_str = hs.get_model_trained_at(river, post) if has_model else None
+    model_age_days: Optional[int] = None
+    model_age_penalty = 0.0
+    model_age_warning: Optional[str] = None
+    if model_trained_at_str:
+        try:
+            m_dt = datetime.datetime.fromisoformat(model_trained_at_str[:19]).date()
+            model_age_days = max(0, (today - m_dt).days)
+            if model_age_days > 90:
+                # Штраф до 0.20 при возрасте модели свыше 90 дней (по 0.02 за каждые 30 дн сверх 90)
+                model_age_penalty = min(0.20, round(0.02 * ((model_age_days - 90) / 30.0), 3))
+                model_age_warning = (
+                    f"ML-модель обучена {model_age_days} дн. назад ({str(m_dt)}). "
+                    f"Уверенность скорректирована на -{int(round(model_age_penalty * 100))}%."
+                )
+        except Exception:
+            pass
 
     prob_warn = max((p.get("prob_warning") or 0) for p in forecast_points) if forecast_points else None
     prob_dang = max((p.get("prob_danger") or 0) for p in forecast_points) if forecast_points else None
@@ -664,7 +730,7 @@ def assess_flood_risk(
     if is_q90_synthetic:
         base_conf = max(0.0, base_conf - 0.15)
     verdict_confidence = round(
-        max(0.0, min(1.0, base_conf - stale_penalty)), 3)
+        max(0.0, min(1.0, base_conf - stale_penalty - model_age_penalty)), 3)
     verdict_reason_parts: List[str] = []
     val_label = "медиана" if is_q90_synthetic else "q90"
     if p_exceed_crit is not None and p_exceed_crit >= 0.5:
@@ -749,6 +815,8 @@ def assess_flood_risk(
         parts.append(f"Для контекста: в {year - 1} г. лёд вскрывался ~{last_year_breakup}.")
     if not has_model:
         parts.append("Обученной ML-модели нет — оценка основана на правилах и климатологии.")
+    elif model_age_warning:
+        parts.append(model_age_warning)
     if stale_warning:
         parts.append(stale_warning)
 
@@ -762,6 +830,10 @@ def assess_flood_risk(
         "risk_class": risk_class_en,
         "risk_class_ru": risk_class_ru,
         "has_model": has_model,
+        "model_trained_at": model_trained_at_str,
+        "model_age_days": model_age_days,
+        "model_age_warning": model_age_warning,
+        "model_age_penalty": round(model_age_penalty, 3),
         "data_through": data_through.isoformat() if data_through else None,
         "data_lag_days": data_lag_days,
         "stale_warning": stale_warning,
@@ -793,7 +865,7 @@ def assess_flood_risk(
         "drivers": sorted(drivers, key=lambda d: -d["score"]),
         "verdict": verdict,
         "scenarios": scenarios,
-        "data_gaps": _data_gaps(features),
+        "data_gaps": _data_gaps(features, month=month),
         "context": {
             "last_year_ice_breakup": last_year_breakup,
             "season_month": month,
@@ -927,10 +999,11 @@ def record_feedback(
     alert_id: Optional[int] = None,
     actual_class: Optional[str] = None,
     comment: Optional[str] = None,
+    rule_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Поощрение/наказание модели.
 
-    - reward  → веса драйверов связанного алерта +0.1;
+    - reward  → веса драйверов связанного алерта или переданных rule_ids +0.1;
     - penalty → −0.15 (правила стреляли зря).
     Вес зажат в [0.1..2.5].
     """
@@ -944,7 +1017,7 @@ def record_feedback(
 
     conn = _agent_db()
     try:
-        rule_ids: List[str] = []
+        updated_rule_ids: List[str] = list(rule_ids or [])
         if alert_id is not None:
             row = conn.execute(
                 "SELECT drivers_json FROM agent_alerts WHERE id=?", (int(alert_id),)
@@ -953,19 +1026,19 @@ def record_feedback(
                 try:
                     for d in json.loads(row["drivers_json"]):
                         rid = d.get("id")
-                        if rid:
-                            rule_ids.append(rid)
+                        if rid and rid not in updated_rule_ids:
+                            updated_rule_ids.append(rid)
                 except Exception:
                     pass
 
         delta = 0.1 if verdict == "reward" else -0.15
-        for rid in rule_ids:
+        for rid in updated_rule_ids:
             _bump_rule_weight(conn, river, post, rid, delta, verdict)
 
         payload = {
             "alert_id": alert_id,
             "actual_class": actual_class,
-            "rules_updated": rule_ids,
+            "rules_updated": updated_rule_ids,
             "delta_per_rule": delta,
         }
         now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -996,7 +1069,7 @@ def record_feedback(
     return {
         "feedback_id": fb_id,
         "verdict": verdict,
-        "rules_updated": rule_ids,
+        "rules_updated": updated_rule_ids,
         "delta_per_rule": delta,
         "current_weights": new_weights,
     }

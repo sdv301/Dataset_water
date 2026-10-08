@@ -199,10 +199,15 @@ class FloodPredictor:
         df = df.sort_index()
 
         # Сдвиг целевой переменной на горизонт прогнозирования
+        # Привязка строго по календарной дате date + horizon, чтобы избежать
+        # ложного сопоставления через зимние/сезонные разрывы рядов.
         target_name = f"target_h{horizon}"
-        df[target_name] = df[target_col].shift(-horizon)
+        target_dates = pd.to_datetime(df.index) + pd.to_timedelta(horizon, unit="D")
+        target_series = pd.Series(df[target_col].values, index=pd.to_datetime(df.index))
+        target_series = target_series[~target_series.index.duplicated(keep="last")]
+        df[target_name] = target_dates.map(target_series).values
 
-        # Удаление NaN из-за сдвига
+        # Удаление строк, где на дату t + horizon нет реальных наблюдений
         df = df.dropna(subset=[target_name])
 
         exclude = [target_col, target_name]
@@ -574,25 +579,49 @@ class FloodPredictor:
                 c for c in df.columns
                 if c not in ("date", "river", "post", "water_level_cm")
             ]
+        return self._format_feature_row(df, date)
+
+    def _format_feature_row(self, df: pd.DataFrame, target_date: datetime.date) -> pd.DataFrame:
+        """Безопасное форматирование строки признаков с заполнением лагов и календаря."""
+        base_level = None
+        if "water_level_cm" in df.columns and pd.notna(df["water_level_cm"].iloc[0]):
+            base_level = float(df["water_level_cm"].iloc[0])
+        elif getattr(self, "_lvl_lo", None) is not None and getattr(self, "_lvl_hi", None) is not None:
+            base_level = (self._lvl_lo + self._lvl_hi) / 2.0
+
         row = {}
         for c in self.features:
             if c in df.columns:
                 val = df[c].iloc[0]
                 try:
-                    row[c] = float(val) if pd.notna(val) else 0.0
+                    if pd.notna(val):
+                        row[c] = float(val)
+                    elif c.startswith("level_") or c.startswith("water_level"):
+                        row[c] = base_level if base_level is not None else 0.0
+                    else:
+                        row[c] = 0.0
                 except (TypeError, ValueError):
                     row[c] = 0.0
+            elif c.startswith("level_") or c.startswith("water_level"):
+                row[c] = base_level if base_level is not None else 0.0
             else:
                 row[c] = 0.0
+
+        # Актуализируем календарные признаки под целевую дату прогноза
+        doy = target_date.timetuple().tm_yday
+        if "day_of_year" in row:
+            row["day_of_year"] = float(doy)
+        if "month" in row:
+            row["month"] = float(target_date.month)
+        if "sin_doy" in row:
+            row["sin_doy"] = float(np.sin(2 * np.pi * doy / 365.25))
+        if "cos_doy" in row:
+            row["cos_doy"] = float(np.cos(2 * np.pi * doy / 365.25))
+
         return pd.DataFrame([row], columns=self.features)
 
     def _load_latest_features(self, on_or_before: datetime.date) -> Optional[pd.DataFrame]:
-        """Последняя доступная строка фичей на/до даты — fallback при устаревших данных.
-
-        Если для base_date нет строки (данные устарели либо это будущее), берём
-        самую свежую доступную строку, чтобы прогноз строился от последнего
-        наблюдения, а не от нулевых признаков.
-        """
+        """Последняя доступная строка фичей на/до даты — fallback при устаревших данных."""
         if not os.path.exists(self.db_path):
             return None
         conn = sqlite3.connect(self.db_path)
@@ -615,17 +644,7 @@ class FloodPredictor:
                 c for c in df.columns
                 if c not in ("date", "river", "post", "water_level_cm")
             ]
-        row = {}
-        for c in self.features:
-            if c in df.columns:
-                val = df[c].iloc[0]
-                try:
-                    row[c] = float(val) if pd.notna(val) else 0.0
-                except (TypeError, ValueError):
-                    row[c] = 0.0
-            else:
-                row[c] = 0.0
-        return pd.DataFrame([row], columns=self.features)
+        return self._format_feature_row(df, on_or_before)
 
     def _level_bounds(self) -> Tuple[Optional[float], Optional[float]]:
         """Наблюдённый диапазон уровня воды по посту (для клиппинга хвостов).

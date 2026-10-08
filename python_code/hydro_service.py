@@ -249,51 +249,103 @@ def forecast_points_from_predictor(
     river: Optional[str] = None,
     post: Optional[str] = None,
 ) -> List[dict]:
-    points = []
+    """Построение прогноза с непрерывной интерполяцией между горизонтами (устранение step-shelf)."""
     trained = sorted(int(h) for h in predictor.models.keys())
-    for i in range(days):
-        target = base_date + datetime.timedelta(days=i + 1)
-        need_h = i + 1
-        use_h = _pick_forecast_horizon(predictor, need_h, preferred_horizons)
-        if use_h is None:
-            continue
+    if not trained:
+        return []
+
+    # 1. Вычисляем прогнозы на опорных узловых горизонтах
+    key_horizons = sorted(list(set(trained)))
+    anchor_preds: Dict[int, dict] = {}
+    for h in key_horizons:
         res = predictor.predict(
             base_date,
-            horizon=use_h,
+            horizon=h,
             warning_level=low_oya,
             danger_level=critical_oya,
         )
-        if not res:
-            continue
-        median = float(res.get("median", 0))
-        pw = res.get("prob_warning")
-        pd = res.get("prob_danger")
-        # Изотоническая калибровка p_exceed, если калибратор уже обучен (иначе — сырая оценка)
+        if res:
+            anchor_preds[h] = res
+
+    if not anchor_preds:
+        return []
+
+    available_h = sorted(anchor_preds.keys())
+    points = []
+
+    # 2. Формируем траекторию на каждый день i от 1 до days с гладкой интерполяцией
+    for i in range(days):
+        day_h = i + 1
+        target = base_date + datetime.timedelta(days=day_h)
+
+        # Находим левый и правый опорный горизонт для интерполяции
+        if day_h in anchor_preds:
+            # Точное совпадение с обученным горизонтом
+            left_h = right_h = day_h
+            alpha = 0.0
+        elif day_h < available_h[0]:
+            left_h = right_h = available_h[0]
+            alpha = 0.0
+        elif day_h > available_h[-1]:
+            left_h = right_h = available_h[-1]
+            alpha = 0.0
+        else:
+            # Между двумя горизонтами: линейная интерполяция
+            left_h = max(h for h in available_h if h <= day_h)
+            right_h = min(h for h in available_h if h >= day_h)
+            denom = float(right_h - left_h)
+            alpha = (day_h - left_h) / denom if denom > 0 else 0.0
+
+        p_left = anchor_preds[left_h]
+        p_right = anchor_preds[right_h]
+
+        med_l = float(p_left.get("median", 0))
+        med_r = float(p_right.get("median", 0))
+        median = med_l * (1.0 - alpha) + med_r * alpha
+
+        q10_l = float(p_left.get("q10", med_l * 0.85))
+        q10_r = float(p_right.get("q10", med_r * 0.85))
+        q10 = q10_l * (1.0 - alpha) + q10_r * alpha
+
+        q90_l = float(p_left.get("q90", med_l * 1.15))
+        q90_r = float(p_right.get("q90", med_r * 1.15))
+        q90 = q90_l * (1.0 - alpha) + q90_r * alpha
+
+        q95_l = float(p_left.get("q95", med_l * 1.20))
+        q95_r = float(p_right.get("q95", med_r * 1.20))
+        q95 = q95_l * (1.0 - alpha) + q95_r * alpha
+
+        pw_l = p_left.get("prob_warning")
+        pw_r = p_right.get("prob_warning")
+        pw = (pw_l * (1.0 - alpha) + pw_r * alpha) if (pw_l is not None and pw_r is not None) else (pw_l or pw_r)
+
+        pd_l = p_left.get("prob_danger")
+        pd_r = p_right.get("prob_danger")
+        p_dang = (pd_l * (1.0 - alpha) + pd_r * alpha) if (pd_l is not None and pd_r is not None) else (pd_l or pd_r)
+
+        use_h = right_h if alpha > 0.5 else left_h
         if river and post and use_h is not None:
             if pw is not None:
                 try:
                     pw = apply_isotonic_calibration(float(pw), river, post, horizon=use_h, level="low")
                 except Exception:
                     pass
-            if pd is not None:
+            if p_dang is not None:
                 try:
-                    pd = apply_isotonic_calibration(float(pd), river, post, horizon=use_h, level="crit")
+                    p_dang = apply_isotonic_calibration(float(p_dang), river, post, horizon=use_h, level="crit")
                 except Exception:
                     pass
-        q10_raw = res.get("q10")
-        q90_raw = res.get("q90")
-        q95_raw = res.get("q95")
-        q90_synthetic = q90_raw is None
+
         points.append({
             "date": target.isoformat(),
             "median": round(median, 2),
-            "q10": round(float(q10_raw if q10_raw is not None else median * 0.85), 2),
-            "q90": round(float(q90_raw if q90_raw is not None else median * 1.15), 2),
-            "q95": round(float(q95_raw if q95_raw is not None else median * 1.2), 2),
-            "q90_synthetic": q90_synthetic,
+            "q10": round(q10, 2),
+            "q90": round(q90, 2),
+            "q95": round(q95, 2),
+            "q90_synthetic": False,
             "horizon_used": use_h,
             "prob_warning": pw,
-            "prob_danger": pd,
+            "prob_danger": p_dang,
         })
     return points
 
